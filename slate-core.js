@@ -165,6 +165,7 @@
     const h = await engine.ocr(head, { psm: "6" });
     r.header = parseHeader(h.text);
     r.headerImage = head;
+    r.category = findCategory(h.text);
     if (!r.barcode && !r.header.subjectLineFound && !r.header.school) {
       r.isSlate = false;
       return r;
@@ -207,6 +208,17 @@
   }
 
   // ---------- session type ----------
+  // special slate groups, found by wording anywhere in the header block (name, School, Job Name, Subject ID lines)
+  const CATEGORIES = [
+    { key: "NONCON", label: "Non-Contracted Seniors", folder: "0_Non_Contracted", re: /n[o0]n[^a-z0-9]{0,3}c[o0]n[t+f]ra/ },
+    { key: "PREV", label: "Previous Seniors", folder: "0_Prev_Seniors", re: /prev(i[o0]us)?[^a-z0-9]{0,3}s[e3]n[i1l]{1,2}[o0]r/ },
+  ];
+  function findCategory(text) {
+    const t = (text || "").toLowerCase();
+    const hits = CATEGORIES.filter((c) => c.re.test(t));
+    return hits.length === 1 ? hits[0] : hits.length > 1 ? { key: "BOTH", label: "both Non-Contracted and Previous Seniors" } : null;
+  }
+
   const SESSIONS = ["Yearbook", "Essentials", "Popular", "Graduate", "VIP"];
   // folder names, matching the choices offered when a person picks the session by hand
   const SESSION_CODES = { Yearbook: "YBK", Essentials: "ESS", Popular: "POP", Graduate: "GRAD", VIP: "OTHER" };
@@ -330,7 +342,8 @@
     if (subjectId && r.barcode && subjectId !== r.barcode) {
       reasons.push(`Subject ID ${subjectId} does not match barcode ${r.barcode}`);
     }
-    if (!r.code) reasons.push("school code could not be read");
+    if (r.category && r.category.key === "BOTH") reasons.push("slate mentions both Non-Contracted and Previous Seniors");
+    if (!r.code && !r.category) reasons.push("school code could not be read");
     else if (knownCodes && knownCodes.size && !knownCodes.has(r.code)) reasons.push(`school code ${r.code} is not on the school list`);
     if (!r.header.first && !r.header.last) reasons.push("student name could not be read");
     let session = "", sessionReason = "";
@@ -357,13 +370,14 @@
 
   // "ATM - Jordan Alvarez.pdf"
   function fileBase(r, d, fallback) {
-    const code = cleanName(r.code) || "NO CODE";
+    const short = { NONCON: "Non-Contracted", PREV: "Prev Senior" };
+    const code = cleanName(r.code) || (r.category && short[r.category.key]) || "NO CODE";
     const person = cleanName(`${r.header ? r.header.first : ""} ${r.header ? r.header.last : ""}`)
       || `ID ${d.subjectId || r.barcode || fallback}`;
     return `${code} - ${person}`;
   }
 
-  const api = { SESSIONS, SESSION_CODES, SESSION_CHOICES, crop, gray, threshold, scale, pad, redInk, parseHeader, readSlate, decide, fileBase, cleanName };
+  const api = { CATEGORIES, findCategory, SESSIONS, SESSION_CODES, SESSION_CHOICES, crop, gray, threshold, scale, pad, redInk, parseHeader, readSlate, decide, fileBase, cleanName };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.SlateCore = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

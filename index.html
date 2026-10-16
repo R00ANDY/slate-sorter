@@ -149,7 +149,7 @@ footer { font-size: 0.85rem; color: var(--muted); }
   <section class="step" id="step2">
     <div class="num">2</div>
     <h2>Choose where to save</h2>
-    <p class="help" id="saveHelp">Pick a folder. School folders (with a folder per session type inside) and a Flagged folder will be created inside it.</p>
+    <p class="help" id="saveHelp">Pick a folder. A folder per school (with session folders and a 0_Flagged folder inside) is created in it, plus 0_Non_Contracted, 0_Prev_Seniors and 0_Flagged at the top when needed.</p>
     <div class="body">
       <button type="button" id="pickFolder">Choose folder</button>
       <div class="picked" id="folderPicked">No folder chosen yet</div>
@@ -191,7 +191,7 @@ footer { font-size: 0.85rem; color: var(--muted); }
     </div>
   </div>
 
-  <footer>Slates with a missing or mismatched Subject ID go into the <b>Flagged</b> folder for a person to check. Slates where only the session type is unclear stay in their school folder, and you can pick the session type when the scan finishes. A results spreadsheet is saved alongside the folders.</footer>
+  <footer>Non-Contracted Seniors and Previous Seniors slates go into the <b>0_Non_Contracted</b> and <b>0_Prev_Seniors</b> folders. Slates with a missing or mismatched Subject ID go into a <b>0_Flagged</b> folder inside their school folder (or at the top when the school can't be read) for a person to check. Slates where only the session type is unclear stay in their school folder, and you can pick the session type when the scan finishes. A results spreadsheet is saved alongside the folders.</footer>
 </div>
 
 <script src="lib/tesseract.min.js"></script>
@@ -211,7 +211,7 @@ ZXingWASM.setZXingModuleOverrides({
 });
 
 const DPI = 300;
-const FLAGGED = "Flagged";
+const FLAGGED = "0_Flagged";   // inside each school folder; at the top level only when the school is unknown
 const state = { input: null, dir: null, zipMode: false, running: false, rows: [], writer: null, stamp: "" };
 const NEEDED = "SESSION NEEDED";
 
@@ -421,8 +421,18 @@ async function exists(dir, name) {
 }
 
 // where a slate belongs; session = "YBK" etc., or "" when it still needs one
+// top-level folder for a slate: its Non-Contracted / Previous Seniors folder, else its school code, else "" (unknown)
+function homeOf(r) {
+  if (r.category && r.category.folder) return r.category.folder;
+  return Core.cleanName(r.code || "");
+}
+// label used in file names and on screen
+function groupLabel(r) {
+  return r.category && r.category.folder ? r.category.label : (r.code || "");
+}
+
 function targetFor(row, session) {
-  const code = Core.cleanName(row.r.code);
+  const code = homeOf(row.r);
   const base = Core.fileBase(row.r, row.d, `page ${row.page}`);
   return session ? { folder: `${code}/${session}`, base } : { folder: code, base: `${base} - ${NEEDED}` };
 }
@@ -494,7 +504,10 @@ async function run() {
         const row = { source: item.label, page: item.pageNo, r, d, how: r.session && r.session.how || "" };
         if (d.status !== "skipped") {
           const out = await item.makePdf();
-          const t = d.status === "flagged" ? { folder: FLAGGED, base: Core.fileBase(r, d, `page ${item.pageNo}`) } : targetFor(row, d.session);
+          const home = homeOf(r);
+          const t = d.status === "flagged"
+            ? { folder: home ? `${home}/${FLAGGED}` : FLAGGED, base: Core.fileBase(r, d, `page ${item.pageNo}`) }
+            : targetFor(row, d.session);
           row.folder = t.folder;
           row.file = await writer.write(t.folder, t.base, "pdf", out);
           row.session = d.session;
@@ -619,7 +632,7 @@ function review(list) {
       $("rvWho").textContent = `${x.r.header.first} ${x.r.header.last}`.trim() || "Name not read";
       $("rvName").src = x.shots.name; $("rvName").alt = `Printed name on the slate: ${x.r.header.name}`;
       $("rvShot").src = x.shots.session; $("rvShot").alt = "Close-up of the session type area of the slate";
-      $("rvInfo").innerHTML = `School <b>${esc(x.r.code)}</b> · Subject ID <b>${esc(x.d.subjectId)}</b> · ${esc(x.d.reasons[0] || "")}`;
+      $("rvInfo").innerHTML = `${x.r.category && x.r.category.folder ? `<b>${esc(x.r.category.label)}</b> · ` : ""}School <b>${esc(x.r.code || "not read")}</b> · Subject ID <b>${esc(x.d.subjectId)}</b> · ${esc(x.d.reasons[0] || "")}`;
       $("rvChoices").querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.choice === x.session)));
       $("rvBack").disabled = i === 0;
       $("rvChoices").querySelector("button").focus();
@@ -684,7 +697,7 @@ function showResults(message, failed) {
   const flagged = slates.filter((x) => x.d.status === "flagged");
   const skipped = rows.filter((x) => x.d.status === "skipped");
   const bySchool = {};
-  [...ok, ...need].forEach((x) => (bySchool[x.r.code] = bySchool[x.r.code] || []).push(x));
+  [...ok, ...need].forEach((x) => { const g = groupLabel(x.r); (bySchool[g] = bySchool[g] || []).push(x); });
   const schools = Object.keys(bySchool).sort();
   const order = (x) => (x.session ? Core.SESSION_CHOICES.indexOf(x.session) : 99);
 
@@ -693,23 +706,23 @@ function showResults(message, failed) {
     <div class="saved${failed ? " bad" : ""}">${esc(message)}</div>
     ${state.zip ? `<div><button type="button" class="primary big" id="saveZip">Save the sorted slates</button> <span class="note" id="zipNote"></span></div>` : ""}
     <div class="summary">
-      <div class="tile ok"><b>${ok.length}</b>sorted into ${new Set(ok.map((x) => x.r.code)).size} school folder${new Set(ok.map((x) => x.r.code)).size === 1 ? "" : "s"}</div>
+      <div class="tile ok"><b>${ok.length}</b>sorted into ${new Set(ok.map((x) => groupLabel(x.r))).size} folder${new Set(ok.map((x) => groupLabel(x.r))).size === 1 ? "" : "s"}</div>
       ${need.length ? `<div class="tile need"><b>${need.length}</b>still need a session type</div>` : ""}
       <div class="tile flag"><b>${flagged.length}</b>flagged for checking</div>
       <div class="tile"><b>${skipped.length}</b>page${skipped.length === 1 ? "" : "s"} or file${skipped.length === 1 ? "" : "s"} skipped</div>
     </div>
     ${need.length ? `<div class="panel"><h3>Still need a session type</h3>
-      <p class="meta" style="margin:0">These are in their school folder, named “… - ${NEEDED}”. Pick the session now, or later by moving the file into the right session folder yourself.</p>
+      <p class="meta" style="margin:0">These are in their school (or group) folder, named “… - ${NEEDED}”. Pick the session now, or later by moving the file into the right session folder yourself.</p>
       <div><button type="button" class="primary" id="pickNow">Pick session types now (${need.length})</button></div>
-      <div class="tablewrap"><table><thead><tr><th>School</th><th>File</th><th>Why</th></tr></thead><tbody>
-      ${need.map((x) => `<tr><td>${esc(x.r.code)}</td><td>${esc(x.file)}</td><td>${esc(x.d.reasons[0] || "")}</td></tr>`).join("")}
+      <div class="tablewrap"><table><thead><tr><th>Folder</th><th>File</th><th>Why</th></tr></thead><tbody>
+      ${need.map((x) => `<tr><td>${esc(groupLabel(x.r))}</td><td>${esc(x.file)}</td><td>${esc(x.d.reasons[0] || "")}</td></tr>`).join("")}
       </tbody></table></div>
     </div>` : ""}
     ${flagged.length ? `<div class="panel"><h3>Flagged slates</h3>
-      <p class="meta" style="margin:0">These are in the <b>${FLAGGED}</b> folder. Check each one against the paper slate.</p>
+      <p class="meta" style="margin:0">Each is in a <b>${FLAGGED}</b> folder inside its school folder, or in the top-level <b>${FLAGGED}</b> folder when the school couldn't be read. Check each one against the paper slate.</p>
       ${flagged.map((x) => `<div class="flagitem">
         <div class="why">${esc(x.d.reasons.join(". "))}</div>
-        <div class="meta">Saved as <code>${esc(x.file)}</code> · Session <code>${esc(x.d.session || "not clear")}</code> · Barcode <code>${esc(x.r.barcode || "not read")}</code> · Subject ID on slate <code>${esc(x.d.subjectId || "none")}</code> · ${esc(x.source)}${x.page ? `, page ${x.page}` : ""}</div>
+        <div class="meta">Saved in <code>${esc(x.folder)}</code> as <code>${esc(x.file)}</code> · Session <code>${esc(x.d.session || "not clear")}</code> · Barcode <code>${esc(x.r.barcode || "not read")}</code> · Subject ID on slate <code>${esc(x.d.subjectId || "none")}</code> · ${esc(x.source)}${x.page ? `, page ${x.page}` : ""}</div>
         ${x.preview ? `<img src="${x.preview}" alt="Top of the flagged slate for ${esc(x.file)}">` : ""}
       </div>`).join("")}
     </div>` : ""}
@@ -750,12 +763,12 @@ async function saveZip() {
 }
 
 function toCsv(rows) {
-  const head = ["Result", "Folder", "File", "Student", "School code", "Session type", "Session decided by", "Subject ID on slate", "Barcode", "Why flagged or skipped", "Notes", "Source file", "Page"];
+  const head = ["Result", "Folder", "File", "Student", "School code", "Group", "Session type", "Session decided by", "Subject ID on slate", "Barcode", "Why flagged or skipped", "Notes", "Source file", "Page"];
   const lines = [head];
   for (const x of rows) {
     const st = x.d.status;
     const status = st === "ok" ? "Sorted" : st === "session" ? (x.session ? "Sorted" : "Sorted - session needed") : st === "flagged" ? "Flagged" : "Skipped";
-    lines.push([status, x.folder || "", x.file || "", x.r.header ? x.r.header.name : "", x.r.code || "",
+    lines.push([status, x.folder || "", x.file || "", x.r.header ? x.r.header.name : "", x.r.code || "", (x.r.category && x.r.category.label) || "",
       x.session || "", x.how || "", x.d.subjectId || "", x.r.barcode || "",
       st === "ok" || (st === "session" && x.session) ? "" : x.d.reasons.join("; "), x.d.notes.join("; "), x.source, x.page]);
   }
