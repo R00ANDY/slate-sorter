@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Slate Sorter</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='8' width='26' height='19' rx='3' fill='%231f5f8b'/%3E%3Cpath d='M3 11a3 3 0 0 1 3-3h7l3 3' fill='%231f5f8b'/%3E%3Crect x='8' y='14' width='16' height='2' fill='%23fff'/%3E%3Crect x='8' y='19' width='10' height='2' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+/* Layout: one centered column of three numbered steps, then a results area; big targets for occasional users */
+:root {
+  --bg: #f3f4f1;
+  --card: #ffffff;
+  --ink: #1c2421;
+  --muted: #5d6762;
+  --line: #d6dad5;
+  --accent: #1f5f8b;
+  --accent-ink: #ffffff;
+  --accent-soft: #e3edf5;
+  --ok: #2a7347;
+  --ok-soft: #e2f1e7;
+  --flag: #9a5b00;
+  --flag-soft: #fbf0dc;
+  --err: #a8322a;
+  --sans: "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151a18; --card: #1e2522; --ink: #e6ebe8; --muted: #9aa5a0; --line: #343d39;
+    --accent: #7cb7e0; --accent-ink: #0d1a24; --accent-soft: #1d3140;
+    --ok: #74c793; --ok-soft: #1c3326; --flag: #f0b45c; --flag-soft: #3a2c14; --err: #f08a80;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151a18; --card: #1e2522; --ink: #e6ebe8; --muted: #9aa5a0; --line: #343d39;
+  --accent: #7cb7e0; --accent-ink: #0d1a24; --accent-soft: #1d3140;
+  --ok: #74c793; --ok-soft: #1c3326; --flag: #f0b45c; --flag-soft: #3a2c14; --err: #f08a80;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 17px; line-height: 1.5; }
+.wrap { max-width: 860px; margin: 0 auto; padding-block: 32px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 20px; }
+header h1 { font-size: 2rem; margin: 0; font-weight: 700; letter-spacing: -0.01em; }
+header p { margin: 4px 0 0; color: var(--muted); max-width: 60ch; }
+.step { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px;
+  display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 4px 16px; align-items: start; }
+.num { grid-row: span 3; width: 40px; height: 40px; border-radius: 50%; background: var(--accent-soft); color: var(--accent);
+  font-weight: 700; font-size: 1.15rem; display: grid; place-items: center; }
+.step.done .num { background: var(--ok-soft); color: var(--ok); }
+.step h2 { margin: 6px 0 0; font-size: 1.2rem; }
+.step .help { margin: 0; color: var(--muted); font-size: 0.95rem; }
+.step .body { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 10px; }
+button { font: inherit; font-weight: 600; border-radius: 8px; cursor: pointer; padding: 12px 20px; min-height: 48px;
+  border: 2px solid var(--accent); background: var(--card); color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); }
+button.big { font-size: 1.15rem; padding: 14px 28px; min-height: 56px; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.picked { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+.picked small { display: block; font-weight: 400; color: var(--muted); }
+.drop { border: 2px dashed var(--line); border-radius: 10px; padding: 14px; color: var(--muted); font-size: 0.95rem; width: 100%; text-align: center; }
+.drop.over { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.note { font-size: 0.92rem; color: var(--muted); }
+.warn { color: var(--err); font-weight: 600; }
+.progress { width: 100%; display: flex; flex-direction: column; gap: 8px; }
+.bar { height: 14px; background: var(--line); border-radius: 7px; overflow: hidden; }
+.bar > div { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+.ptext { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-variant-numeric: tabular-nums; }
+#results { display: flex; flex-direction: column; gap: 16px; }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.tile { border-radius: 12px; padding: 16px 18px; background: var(--card); border: 1px solid var(--line); }
+.tile b { display: block; font-size: 2rem; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.tile.ok { background: var(--ok-soft); border-color: transparent; } .tile.ok b { color: var(--ok); }
+.tile.flag { background: var(--flag-soft); border-color: transparent; } .tile.flag b { color: var(--flag); }
+.panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
+.panel h3 { margin: 0; font-size: 1.15rem; }
+.flagitem { border-top: 1px solid var(--line); padding-top: 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.flagitem:first-of-type { border-top: 0; padding-top: 0; }
+.flagitem .why { font-weight: 600; color: var(--flag); }
+.flagitem img { width: 100%; max-width: 640px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+.meta { font-size: 0.9rem; color: var(--muted); }
+.meta code, td code { font-family: var(--mono); color: var(--ink); }
+details { border-top: 1px solid var(--line); padding-top: 8px; }
+details:first-of-type { border-top: 0; }
+summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.saved { background: var(--ok-soft); color: var(--ok); border-radius: 10px; padding: 14px 16px; font-weight: 600; }
+.saved.bad { background: var(--flag-soft); color: var(--flag); }
+footer { font-size: 0.85rem; color: var(--muted); }
+.howzip { width: 100%; font-size: 0.95rem; color: var(--muted); border: 0; padding: 0; }
+.howzip summary { font-weight: 600; color: var(--accent); }
+.howzip p { margin: 6px 0 0; max-width: 62ch; }
+.tile.need { background: var(--accent-soft); border-color: transparent; } .tile.need b { color: var(--accent); }
+.overlay { position: fixed; inset: 0; z-index: 50; background: rgba(10, 16, 14, 0.62); display: grid; place-items: center;
+  padding: max(12px, env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) max(12px, env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px)); }
+.sheet { background: var(--card); color: var(--ink); border-radius: 14px; width: min(760px, 100%); max-height: 100%; overflow: auto;
+  padding: 20px 22px; display: flex; flex-direction: column; gap: 14px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35); }
+.rvhead { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.rvhead h2 { margin: 0; font-size: 1.35rem; }
+.rvcount { font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 600; }
+.rvwho { display: flex; flex-direction: column; gap: 4px; }
+.rvwho .who { font-size: 1.15rem; font-weight: 700; }
+.rvname { width: 100%; max-width: 520px; background: #fff; border: 1px solid var(--line); border-radius: 6px; }
+.rvshot { width: 100%; background: #fff; border: 2px solid var(--line); border-radius: 8px; }
+.choices { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 520px) { .choices { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.choices button { font-size: 1.2rem; min-height: 64px; padding: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+.choices button small { font-size: 0.72rem; font-weight: 500; opacity: 0.75; }
+.choices button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.rvfoot { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
+.rvfoot .right { display: flex; gap: 10px; flex-wrap: wrap; }
+.rvfoot button { border-color: var(--line); color: var(--ink); }
+#rvSkip { border-color: var(--flag); color: var(--flag); }
+.rvbusy { opacity: 0.5; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { .bar > div { transition: none; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <h1>Slate Sorter</h1>
+    <p>Reads scanned slates, checks each Subject ID against its barcode, and files every slate into its school code folder, then into a folder for its session type (YBK, ESS, POP, GRAD or OTHER). Everything stays on this computer.</p>
+  </header>
+
+  <section class="step" id="step1">
+    <div class="num">1</div>
+    <h2>Choose the scanned slates</h2>
+    <p class="help">Pick <b>one</b> file: the PDF from the scanner (one slate or a whole stack), or a ZIP folder holding separate slate files.</p>
+    <div class="body">
+      <button type="button" id="pickFiles">Choose scan file</button>
+      <input type="file" id="fileInput" accept="application/pdf,.pdf,application/zip,.zip" hidden>
+      <div class="picked" id="filesPicked">No file chosen yet</div>
+      <div class="drop" id="drop">Or drag the file here</div>
+      <details class="howzip"><summary>Have lots of separate slate files?</summary>
+        <p>Select them all in File Explorer, right-click, and choose <b>Send to → Compressed (zipped) folder</b>. Then choose that ZIP here. PDF, JPG and PNG files inside it are read; anything else is listed and skipped.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="step" id="step2">
+    <div class="num">2</div>
+    <h2>Choose where to save</h2>
+    <p class="help" id="saveHelp">Pick a folder. School folders (with a folder per session type inside) and a Flagged folder will be created inside it.</p>
+    <div class="body">
+      <button type="button" id="pickFolder">Choose folder</button>
+      <div class="picked" id="folderPicked">No folder chosen yet</div>
+    </div>
+  </section>
+
+  <section class="step" id="step3">
+    <div class="num">3</div>
+    <h2>Sort the slates</h2>
+    <p class="help" id="startHelp">Getting ready…</p>
+    <div class="body">
+      <button type="button" class="primary big" id="start" disabled>Start sorting</button>
+      <div class="progress" id="progress" hidden>
+        <div class="bar"><div id="barFill"></div></div>
+        <div class="ptext"><span id="pNow">Starting…</span><span id="pLeft"></span></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="results" hidden></section>
+
+  <div class="overlay" id="review" hidden role="dialog" aria-modal="true" aria-labelledby="rvTitle">
+    <div class="sheet" id="rvSheet">
+      <div class="rvhead"><h2 id="rvTitle">Which session is this?</h2><span class="rvcount" id="rvCount"></span></div>
+      <div class="rvwho">
+        <div class="who" id="rvWho"></div>
+        <img class="rvname" id="rvName" alt="">
+        <div class="meta" id="rvInfo"></div>
+      </div>
+      <img class="rvshot" id="rvShot" alt="">
+      <div class="choices" id="rvChoices"></div>
+      <div class="rvfoot">
+        <button type="button" id="rvBack">← Back</button>
+        <div class="right">
+          <button type="button" id="rvSkip">Skip this one <small>(S)</small></button>
+          <button type="button" id="rvStop">Finish later</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>Slates with a missing or mismatched Subject ID go into the <b>Flagged</b> folder for a person to check. Slates where only the session type is unclear stay in their school folder, and you can pick the session type when the scan finishes. A results spreadsheet is saved alongside the folders.</footer>
+</div>
+
+<script src="lib/tesseract.min.js"></script>
+<script src="lib/zxing-reader.js"></script>
+<script src="lib/pdf-lib.min.js"></script>
+<script src="lib/fflate.js"></script>
+<script src="slate-core.js"></script>
+<script type="module">
+import * as pdfjsLib from "./lib/pdf.min.mjs";
+
+const $ = (id) => document.getElementById(id);
+const abs = (p) => new URL(p, location.href).href;
+const Core = window.SlateCore;
+pdfjsLib.GlobalWorkerOptions.workerSrc = abs("lib/pdf.worker.min.mjs");
+ZXingWASM.setZXingModuleOverrides({
+  locateFile: (path, prefix) => (path.endsWith(".wasm") ? abs("lib/zxing_reader.wasm") : prefix + path),
+});
+
+const DPI = 300;
+const FLAGGED = "Flagged";
+const state = { input: null, dir: null, zipMode: false, running: false, rows: [], writer: null, stamp: "" };
+const NEEDED = "SESSION NEEDED";
+
+// ---------- engines ----------
+let worker = null;
+const ready = (async () => {
+  worker = await Tesseract.createWorker("eng", 1, {
+    workerPath: abs("lib/worker.min.js"),
+    corePath: abs("lib/core/"),
+    // published as gzipped traineddata under a .wasm name; the "#" makes Tesseract's appended file name a URL fragment
+    langPath: abs("lib/lang/eng-traineddata.wasm") + "#",
+    cacheMethod: "none",
+  });
+  await ZXingWASM.getZXingModule();
+})();
+ready.then(() => updateStart()).catch((e) => {
+  console.error(e);
+  $("startHelp").innerHTML = '<span class="warn">The reading engine failed to load. Reload the page. If it keeps happening, check the internet connection.</span>';
+});
+
+function toCanvas(img) {
+  const c = document.createElement("canvas");
+  c.width = img.width; c.height = img.height;
+  c.getContext("2d").putImageData(new ImageData(img.data, img.width, img.height), 0, 0);
+  return c;
+}
+
+const engine = {
+  async ocr(img, { psm, whitelist = "" }) {
+    await worker.setParameters({ tessedit_pageseg_mode: psm, tessedit_char_whitelist: whitelist });
+    const { data } = await worker.recognize(toCanvas(img), {}, { text: true, blocks: true });
+    const words = [];
+    (data.blocks || []).forEach((b) => b.paragraphs.forEach((p) => p.lines.forEach((l) =>
+      l.words.forEach((w) => words.push({ text: w.text, bbox: w.bbox })))));
+    return { text: data.text, words };
+  },
+  async barcodes(img) {
+    const res = await ZXingWASM.readBarcodesFromImageData(new ImageData(img.data, img.width, img.height),
+      { formats: ["Code39"], tryHarder: true });
+    return res.filter((r) => r.isValid).map((r) => r.text);
+  },
+};
+
+// ---------- step 1: one PDF, or one ZIP of loose slate files ----------
+$("pickFiles").addEventListener("click", () => $("fileInput").click());
+$("fileInput").addEventListener("change", (e) => { setInput([...e.target.files]); e.target.value = ""; });
+const drop = $("drop");
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); setInput([...e.dataTransfer.files]); });
+
+const ZIP_HELP = "To sort separate slate files, put them in one ZIP folder first: select them, right-click, and choose Send to → Compressed (zipped) folder.";
+const SLATE_EXT = /\.(pdf|jpe?g|png)$/i;
+const IGNORE = /(^|\/)(__MACOSX\/|\.|Thumbs\.db$|desktop\.ini$)/i;
+
+function pickedError(msg) {
+  state.input = null;
+  $("filesPicked").innerHTML = `<span class="warn">${esc(msg)}</span>`;
+  $("step1").classList.remove("done");
+  updateStart();
+}
+
+async function setInput(list) {
+  if (!list.length) return;
+  if (list.length > 1) return pickedError(`You chose ${list.length} files. ${ZIP_HELP}`);
+  const f = list[0];
+  $("filesPicked").textContent = "Checking the file…";
+  try {
+    if (/\.pdf$/i.test(f.name)) {
+      const doc = await pdfjsLib.getDocument({ data: new Uint8Array(await f.arrayBuffer()), isEvalSupported: false }).promise;
+      const pages = doc.numPages; await doc.destroy();
+      state.input = { kind: "pdf", file: f, pages };
+      $("filesPicked").innerHTML = `${esc(f.name)}<small>${pages} page${pages === 1 ? "" : "s"} to read</small>`;
+    } else if (/\.zip$/i.test(f.name)) {
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      const entries = [], others = [];
+      fflate.unzipSync(bytes, { filter: (e) => {
+        if (e.name.endsWith("/") || IGNORE.test(e.name)) return false;
+        (SLATE_EXT.test(e.name) ? entries : others).push(e.name);
+        return false; // list only; each file is unpacked when its turn comes
+      } });
+      entries.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+      if (!entries.length) return pickedError(`${f.name} has no PDF, JPG or PNG files in it.`);
+      state.input = { kind: "zip", file: f, bytes, entries, others };
+      $("filesPicked").innerHTML = `${esc(f.name)}<small>${entries.length} slate file${entries.length === 1 ? "" : "s"} inside${others.length ? ` · ${others.length} other file${others.length === 1 ? "" : "s"} will be skipped` : ""}</small>`;
+    } else if (/\.(jpe?g|png|tiff?)$/i.test(f.name)) {
+      return pickedError(`${f.name} is a single picture. ${ZIP_HELP}`);
+    } else {
+      return pickedError(`${f.name} is not a PDF or ZIP file. Choose the PDF from the scanner, or a ZIP of slate files.`);
+    }
+  } catch (e) {
+    console.error(e);
+    return pickedError(/\.zip$/i.test(f.name)
+      ? `${f.name} could not be opened. It may be damaged or password-protected. Make the ZIP again and retry.`
+      : `${f.name} could not be opened as a PDF. It may be damaged or password-protected.`);
+  }
+  $("step1").classList.add("done");
+  updateStart();
+}
+
+// ---------- step 2: folder ----------
+const canPickFolder = "showDirectoryPicker" in window;
+if (!canPickFolder) useZip("This browser can't save into a folder, so the sorted slates will download as one ZIP file. Use Microsoft Edge or Google Chrome to save straight into a folder.");
+
+function useZip(msg) {
+  state.zipMode = true; state.dir = null;
+  $("saveHelp").textContent = msg;
+  $("pickFolder").hidden = true;
+  $("folderPicked").textContent = "Results will download as a ZIP file";
+  $("step2").classList.add("done");
+  updateStart();
+}
+
+$("pickFolder").addEventListener("click", async () => {
+  try {
+    const dir = await window.showDirectoryPicker({ id: "slate-sorter", mode: "readwrite", startIn: "documents" });
+    if ((await dir.requestPermission({ mode: "readwrite" })) !== "granted") throw new Error("permission");
+    state.dir = dir;
+    $("folderPicked").innerHTML = `${esc(dir.name)}<small>School folders will be created inside this folder</small>`;
+    $("step2").classList.add("done");
+    updateStart();
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    useZip("Saving into a folder isn't allowed here, so the sorted slates will download as one ZIP file.");
+  }
+});
+
+function updateStart() {
+  const engineReady = !!worker;
+  const can = engineReady && state.input && (state.dir || state.zipMode) && !state.running;
+  $("start").disabled = !can;
+  if (state.running) return;
+  $("startHelp").textContent = !engineReady ? "Getting ready…" :
+    !state.input ? "Choose the scan file first." :
+    !(state.dir || state.zipMode) ? "Choose where to save first." : "Ready. Keep this window open until it finishes.";
+}
+
+// ---------- output ----------
+function makeWriter() {
+  const used = new Set();
+  if (state.dir) {
+    const dirAt = async (folder, create) => {
+      let d = state.dir;
+      for (const part of folder.split("/").filter(Boolean)) d = await d.getDirectoryHandle(part, { create });
+      return d;
+    };
+    const writer = {
+      async write(folder, base, ext, bytes) {
+        const d = await dirAt(folder, true);
+        let name = `${base}.${ext}`, n = 2;
+        while (used.has(`${folder}/${name}`) || (await exists(d, name))) name = `${base} (${n++}).${ext}`;
+        used.add(`${folder}/${name}`);
+        const fh = await d.getFileHandle(name, { create: true });
+        const w = await fh.createWritable(); await w.write(bytes); await w.close();
+        return name;
+      },
+      async move(fromFolder, fromName, toFolder, base, ext) {
+        const src = await dirAt(fromFolder, false);
+        const bytes = await (await (await src.getFileHandle(fromName)).getFile()).arrayBuffer();
+        const name = await writer.write(toFolder, base, ext, bytes);
+        await src.removeEntry(fromName);
+        used.delete(`${fromFolder}/${fromName}`);
+        await removeIfEmpty(fromFolder);
+        return name;
+      },
+      async writeRoot(name, bytes) {
+        const fh = await state.dir.getFileHandle(name, { create: true });
+        const w = await fh.createWritable(); await w.write(bytes); await w.close();
+      },
+      async finish() { return `Saved into the “${state.dir.name}” folder.`; },
+    };
+    // a session folder left empty after its only slate moved out
+    async function removeIfEmpty(folder) {
+      const parts = folder.split("/");
+      if (parts.length < 2) return;
+      const d = await dirAt(folder, false);
+      for await (const _ of d.keys()) return;
+      await (await dirAt(parts.slice(0, -1).join("/"), false)).removeEntry(parts[parts.length - 1]);
+    }
+    return writer;
+  }
+  const files = {};
+  return {
+    async write(folder, base, ext, bytes) {
+      let name = `${base}.${ext}`, n = 2;
+      while (files[`${folder}/${name}`]) name = `${base} (${n++}).${ext}`;
+      files[`${folder}/${name}`] = [bytes, { level: 0 }];
+      return name;
+    },
+    async move(fromFolder, fromName, toFolder, base, ext) {
+      const entry = files[`${fromFolder}/${fromName}`];
+      delete files[`${fromFolder}/${fromName}`];
+      let name = `${base}.${ext}`, n = 2;
+      while (files[`${toFolder}/${name}`]) name = `${base} (${n++}).${ext}`;
+      files[`${toFolder}/${name}`] = entry;
+      return name;
+    },
+    async writeRoot(name, bytes) { files[name] = [bytes, { level: 6 }]; },
+    async finish(stamp) {
+      state.zip = { blob: new Blob([fflate.zipSync(files)], { type: "application/zip" }), name: `Sorted slates ${stamp}.zip` };
+      return "Done. Press “Save the sorted slates” below to download them as one ZIP file.";
+    },
+  };
+}
+async function exists(dir, name) {
+  try { await dir.getFileHandle(name); return true; } catch { return false; }
+}
+
+// where a slate belongs; session = "YBK" etc., or "" when it still needs one
+function targetFor(row, session) {
+  const code = Core.cleanName(row.r.code);
+  const base = Core.fileBase(row.r, row.d, `page ${row.page}`);
+  return session ? { folder: `${code}/${session}`, base } : { folder: code, base: `${base} - ${NEEDED}` };
+}
+
+// ---------- reading the input, one page at a time ----------
+async function* pagesOf(input) {
+  if (input.kind === "pdf") {
+    yield* pdfPages(input.file.name, new Uint8Array(await input.file.arrayBuffer()));
+    return;
+  }
+  for (const name of input.entries) {
+    let bytes;
+    try {
+      bytes = fflate.unzipSync(input.bytes, { filter: (e) => e.name === name })[name];
+    } catch (e) {
+      yield { label: name, error: "could not be unpacked from the ZIP" }; continue;
+    }
+    if (/\.pdf$/i.test(name)) {
+      try { yield* pdfPages(name, bytes); } catch (e) { console.error(e); yield { label: name, error: "could not be opened as a PDF" }; }
+    } else {
+      let page;
+      try { page = await renderImage(bytes); } catch (e) { yield { label: name, error: "could not be opened as a picture" }; continue; }
+      yield { label: name, pageNo: 1, page, makePdf: () => imagePdf(bytes) };
+    }
+  }
+}
+
+async function* pdfPages(label, bytes) {
+  const pdfjsDoc = await pdfjsLib.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise;
+  const libDoc = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
+  try {
+    for (let i = 0; i < pdfjsDoc.numPages; i++) {
+      const page = await renderPdfPage(pdfjsDoc, i + 1);
+      yield { label, pageNo: i + 1, pageCount: pdfjsDoc.numPages, page, makePdf: () => singlePagePdf(libDoc, i) };
+    }
+  } finally { await pdfjsDoc.destroy(); }
+}
+
+// ---------- run ----------
+$("start").addEventListener("click", run);
+
+async function run() {
+  state.running = true; updateStart();
+  $("start").hidden = true; $("progress").hidden = false; $("results").hidden = true;
+  $("startHelp").textContent = "Sorting. Keep this window open until it finishes.";
+  window.addEventListener("beforeunload", stayOpen);
+  let lock = null;
+  try { lock = await navigator.wakeLock?.request("screen"); } catch {}
+
+  const input = state.input;
+  const writer = state.writer = makeWriter();
+  const rows = state.rows = [];
+  for (const name of input.others || []) rows.push({ source: name, page: "", r: {}, d: { status: "skipped", reasons: ["not a PDF, JPG or PNG file"], notes: [] } });
+  // pages are known for a PDF; for a ZIP, count files and add any extra pages as they are found
+  let total = input.kind === "pdf" ? input.pages : input.entries.length;
+  let done = 0; const t0 = performance.now();
+  const countedFiles = new Set();
+
+  let failure = "";
+  try {
+    for await (const item of pagesOf(input)) {
+      if (item.pageCount && !countedFiles.has(item.label) && input.kind === "zip") { countedFiles.add(item.label); total += item.pageCount - 1; }
+      $("pNow").textContent = `Reading page ${done + 1} of ${total}`;
+      if (item.error) {
+        rows.push({ source: item.label, page: "", r: {}, d: { status: "skipped", reasons: [item.error], notes: [] } });
+      } else {
+        const r = await Core.readSlate(item.page, engine);
+        const d = Core.decide(r);
+        const row = { source: item.label, page: item.pageNo, r, d, how: r.session && r.session.how || "" };
+        if (d.status !== "skipped") {
+          const out = await item.makePdf();
+          const t = d.status === "flagged" ? { folder: FLAGGED, base: Core.fileBase(r, d, `page ${item.pageNo}`) } : targetFor(row, d.session);
+          row.folder = t.folder;
+          row.file = await writer.write(t.folder, t.base, "pdf", out);
+          row.session = d.session;
+          if (d.status === "flagged") row.preview = previewOf(item.page, !d.session);
+          if (d.status === "session") row.shots = reviewShots(item.page);
+        }
+        rows.push(row);
+      }
+      done++;
+      const per = (performance.now() - t0) / done;
+      $("barFill").style.width = `${Math.min(100, (done / total) * 100)}%`;
+      $("pLeft").textContent = done < total ? `about ${fmtTime(per * (total - done))} left` : "";
+      await new Promise((res) => setTimeout(res, 0));
+    }
+  } catch (e) {
+    console.error(e);
+    failure = `Something went wrong after ${done} of ${total} pages: ${e.message || e}. Slates already saved are in place; run the rest again.`;
+  } finally {
+    window.removeEventListener("beforeunload", stayOpen);
+    try { await lock?.release(); } catch {}
+    $("progress").hidden = true;
+  }
+
+  state.stamp = timestamp();
+  if (pending().length) {
+    $("startHelp").textContent = "Reading finished. Pick the session type for the slates that need one.";
+    await review(pending());
+  }
+  const msg = await finalize();
+  state.running = false;
+  $("startHelp").textContent = "Finished.";
+  $("step3").classList.add("done");
+  showResults(failure || msg, !!failure);
+}
+function stayOpen(e) { e.preventDefault(); e.returnValue = ""; }
+
+const pending = () => state.rows.filter((x) => x.d.status === "session" && !x.session);
+
+// spreadsheet (and ZIP) reflect the latest choices; safe to run again after more choices
+async function finalize() {
+  await state.writer.writeRoot(`Slate Sorter results ${state.stamp}.csv`, new TextEncoder().encode(toCsv(state.rows)));
+  return state.writer.finish(state.stamp);
+}
+
+async function renderPdfPage(doc, n) {
+  const page = await doc.getPage(n);
+  const vp = page.getViewport({ scale: DPI / 72 });
+  const c = document.createElement("canvas");
+  c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  const img = ctx.getImageData(0, 0, c.width, c.height);
+  page.cleanup();
+  c.width = c.height = 0;
+  return { data: img.data, width: img.width, height: img.height };
+}
+
+async function renderImage(bytes) {
+  const bmp = await createImageBitmap(new Blob([bytes]));
+  const w = Math.round(8.5 * DPI), h = Math.round((bmp.height / bmp.width) * w);
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(bmp, 0, 0, w, h); bmp.close();
+  const img = ctx.getImageData(0, 0, w, h);
+  return { data: img.data, width: w, height: h };
+}
+
+async function singlePagePdf(src, index) {
+  const doc = await PDFLib.PDFDocument.create();
+  const [p] = await doc.copyPages(src, [index]);
+  doc.addPage(p);
+  return doc.save();
+}
+
+async function imagePdf(bytes) {
+  const doc = await PDFLib.PDFDocument.create();
+  const isPng = bytes[0] === 0x89 && bytes[1] === 0x50;
+  const img = isPng ? await doc.embedPng(bytes) : await doc.embedJpg(bytes);
+  const w = 612, h = (img.height / img.width) * w;
+  doc.addPage([w, h]).drawImage(img, { x: 0, y: 0, width: w, height: h });
+  return doc.save();
+}
+
+function previewOf(page, withSession) {
+  // header only, or down through the session type list when that is the problem
+  const top = Core.crop(page, 0, 0, 1, withSession ? 0.54 : 0.24);
+  const small = Core.scale(top, 900 / top.width);
+  return toCanvas(small).toDataURL("image/jpeg", 0.8);
+}
+
+// close-ups for the session pop-up: the printed name, and the session type list with its neighbours
+function reviewShots(page) {
+  const name = Core.crop(page, 0.02, 0.012, 0.52, 0.062);
+  const sess = Core.crop(page, 0.30, 0.365, 0.80, 0.545);
+  return {
+    name: toCanvas(Core.scale(name, 720 / name.width)).toDataURL("image/jpeg", 0.85),
+    session: toCanvas(Core.scale(sess, Math.min(1, 1100 / sess.width))).toDataURL("image/jpeg", 0.88),
+  };
+}
+
+// ---------- session pop-up ----------
+const CHOICE_NAMES = { YBK: "Yearbook", ESS: "Essentials", POP: "Popular", GRAD: "Graduate", OTHER: "Other" };
+Core.SESSION_CHOICES.forEach((c, i) => {
+  const b = document.createElement("button");
+  b.type = "button"; b.dataset.choice = c;
+  b.innerHTML = `${c}<small>${CHOICE_NAMES[c]} · ${i + 1}</small>`;
+  $("rvChoices").appendChild(b);
+});
+
+function review(list) {
+  return new Promise((resolve) => {
+    const items = list.slice();
+    let i = 0, busy = false;
+    const overlay = $("review");
+    const lastFocus = document.activeElement;
+
+    function show() {
+      const x = items[i];
+      $("rvCount").textContent = `${i + 1} of ${items.length}`;
+      $("rvWho").textContent = `${x.r.header.first} ${x.r.header.last}`.trim() || "Name not read";
+      $("rvName").src = x.shots.name; $("rvName").alt = `Printed name on the slate: ${x.r.header.name}`;
+      $("rvShot").src = x.shots.session; $("rvShot").alt = "Close-up of the session type area of the slate";
+      $("rvInfo").innerHTML = `School <b>${esc(x.r.code)}</b> · Subject ID <b>${esc(x.d.subjectId)}</b> · ${esc(x.d.reasons[0] || "")}`;
+      $("rvChoices").querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.choice === x.session)));
+      $("rvBack").disabled = i === 0;
+      $("rvChoices").querySelector("button").focus();
+    }
+    async function choose(session) {
+      if (busy) return;
+      busy = true; $("rvSheet").classList.add("rvbusy");
+      const x = items[i];
+      try {
+        if ((x.session || "") !== session) {
+          const t = targetFor(x, session);
+          x.file = await state.writer.move(x.folder, x.file, t.folder, t.base, "pdf");
+          x.folder = t.folder;
+          x.session = session;
+          x.how = session ? "chosen by hand" : "";
+        }
+      } catch (e) {
+        console.error(e);
+        $("rvInfo").innerHTML = `<span class="warn">Could not move the file: ${esc(e.message || e)}. Close any program that has it open and try again.</span>`;
+        busy = false; $("rvSheet").classList.remove("rvbusy");
+        return;
+      }
+      busy = false; $("rvSheet").classList.remove("rvbusy");
+      if (i < items.length - 1) { i++; show(); } else close();
+    }
+    function close() {
+      overlay.hidden = true;
+      document.removeEventListener("keydown", onKey);
+      $("rvChoices").onclick = $("rvSkip").onclick = $("rvStop").onclick = $("rvBack").onclick = null;
+      lastFocus?.focus?.();
+      resolve();
+    }
+    function onKey(e) {
+      if (overlay.hidden || busy) return;
+      const n = Number(e.key);
+      if (n >= 1 && n <= Core.SESSION_CHOICES.length) { e.preventDefault(); choose(Core.SESSION_CHOICES[n - 1]); }
+      else if (e.key === "s" || e.key === "S") { e.preventDefault(); choose(""); }
+      else if (e.key === "Escape") { e.preventDefault(); close(); }
+      else if (e.key === "Tab") {   // keep focus inside the pop-up
+        const f = [...overlay.querySelectorAll("button:not([disabled])")];
+        const k = f.indexOf(document.activeElement);
+        if (e.shiftKey && k <= 0) { e.preventDefault(); f[f.length - 1].focus(); }
+        else if (!e.shiftKey && k === f.length - 1) { e.preventDefault(); f[0].focus(); }
+      }
+    }
+    $("rvChoices").onclick = (e) => { const b = e.target.closest("button"); if (b) choose(b.dataset.choice); };
+    $("rvSkip").onclick = () => choose("");
+    $("rvStop").onclick = close;
+    $("rvBack").onclick = () => { if (i > 0 && !busy) { i--; show(); } };
+    document.addEventListener("keydown", onKey);
+    overlay.hidden = false;
+    show();
+  });
+}
+
+// ---------- results ----------
+function showResults(message, failed) {
+  const rows = state.rows;
+  const slates = rows.filter((x) => x.d.status !== "skipped");
+  const ok = slates.filter((x) => x.d.status === "ok" || (x.d.status === "session" && x.session));
+  const need = slates.filter((x) => x.d.status === "session" && !x.session);
+  const flagged = slates.filter((x) => x.d.status === "flagged");
+  const skipped = rows.filter((x) => x.d.status === "skipped");
+  const bySchool = {};
+  [...ok, ...need].forEach((x) => (bySchool[x.r.code] = bySchool[x.r.code] || []).push(x));
+  const schools = Object.keys(bySchool).sort();
+  const order = (x) => (x.session ? Core.SESSION_CHOICES.indexOf(x.session) : 99);
+
+  const el = $("results");
+  el.innerHTML = `
+    <div class="saved${failed ? " bad" : ""}">${esc(message)}</div>
+    ${state.zip ? `<div><button type="button" class="primary big" id="saveZip">Save the sorted slates</button> <span class="note" id="zipNote"></span></div>` : ""}
+    <div class="summary">
+      <div class="tile ok"><b>${ok.length}</b>sorted into ${new Set(ok.map((x) => x.r.code)).size} school folder${new Set(ok.map((x) => x.r.code)).size === 1 ? "" : "s"}</div>
+      ${need.length ? `<div class="tile need"><b>${need.length}</b>still need a session type</div>` : ""}
+      <div class="tile flag"><b>${flagged.length}</b>flagged for checking</div>
+      <div class="tile"><b>${skipped.length}</b>page${skipped.length === 1 ? "" : "s"} or file${skipped.length === 1 ? "" : "s"} skipped</div>
+    </div>
+    ${need.length ? `<div class="panel"><h3>Still need a session type</h3>
+      <p class="meta" style="margin:0">These are in their school folder, named “… - ${NEEDED}”. Pick the session now, or later by moving the file into the right session folder yourself.</p>
+      <div><button type="button" class="primary" id="pickNow">Pick session types now (${need.length})</button></div>
+      <div class="tablewrap"><table><thead><tr><th>School</th><th>File</th><th>Why</th></tr></thead><tbody>
+      ${need.map((x) => `<tr><td>${esc(x.r.code)}</td><td>${esc(x.file)}</td><td>${esc(x.d.reasons[0] || "")}</td></tr>`).join("")}
+      </tbody></table></div>
+    </div>` : ""}
+    ${flagged.length ? `<div class="panel"><h3>Flagged slates</h3>
+      <p class="meta" style="margin:0">These are in the <b>${FLAGGED}</b> folder. Check each one against the paper slate.</p>
+      ${flagged.map((x) => `<div class="flagitem">
+        <div class="why">${esc(x.d.reasons.join(". "))}</div>
+        <div class="meta">Saved as <code>${esc(x.file)}</code> · Session <code>${esc(x.d.session || "not clear")}</code> · Barcode <code>${esc(x.r.barcode || "not read")}</code> · Subject ID on slate <code>${esc(x.d.subjectId || "none")}</code> · ${esc(x.source)}${x.page ? `, page ${x.page}` : ""}</div>
+        ${x.preview ? `<img src="${x.preview}" alt="Top of the flagged slate for ${esc(x.file)}">` : ""}
+      </div>`).join("")}
+    </div>` : ""}
+    ${schools.length ? `<div class="panel"><h3>Sorted slates</h3>
+      ${schools.map((s) => `<details><summary>${esc(s)} — ${bySchool[s].length} slate${bySchool[s].length === 1 ? "" : "s"}</summary>
+        <div class="tablewrap"><table><thead><tr><th>Session</th><th>File</th><th>Subject ID</th><th>Barcode</th></tr></thead><tbody>
+        ${bySchool[s].sort((p, q) => order(p) - order(q) || p.file.localeCompare(q.file)).map((x) => `<tr><td>${esc(x.session || "needed")}${x.how === "chosen by hand" ? " (by hand)" : ""}</td><td>${esc(x.file)}</td><td><code>${esc(x.d.subjectId)}</code></td><td><code>${esc(x.r.barcode)}</code></td></tr>`).join("")}
+        </tbody></table></div></details>`).join("")}
+    </div>` : ""}
+    ${skipped.length ? `<div class="panel"><h3>Skipped</h3><div class="tablewrap"><table><thead><tr><th>File</th><th>Page</th><th>Why</th></tr></thead><tbody>
+      ${skipped.map((x) => `<tr><td>${esc(x.source)}</td><td>${esc(x.page)}</td><td>${esc(x.d.reasons[0] || "")}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}
+    <div><button type="button" class="primary big" id="again">Sort another batch</button></div>`;
+  el.hidden = false;
+  $("again").addEventListener("click", () => location.reload());
+  if (state.zip) $("saveZip").addEventListener("click", saveZip);
+  if (need.length) $("pickNow").addEventListener("click", async () => {
+    await review(pending());
+    const msg = await finalize();
+    showResults(msg, false);
+  });
+  el.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+}
+
+async function saveZip() {
+  const { blob, name } = state.zip;
+  const note = $("zipNote");
+  const downloads = window.claude?.use ? await window.claude.use("downloads") : null;
+  if (downloads) {
+    try { await downloads.save({ filename: name, data: blob }); note.textContent = "Saved. Open it from your Downloads folder."; }
+    catch (e) { note.textContent = e.code === "declined" ? "Not saved. Press the button again when you're ready." : "This page can't save files here. Open Slate Sorter from its own web address instead."; }
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  note.textContent = `Saved as “${name}” in your Downloads folder.`;
+}
+
+function toCsv(rows) {
+  const head = ["Result", "Folder", "File", "Student", "School code", "Session type", "Session decided by", "Subject ID on slate", "Barcode", "Why flagged or skipped", "Notes", "Source file", "Page"];
+  const lines = [head];
+  for (const x of rows) {
+    const st = x.d.status;
+    const status = st === "ok" ? "Sorted" : st === "session" ? (x.session ? "Sorted" : "Sorted - session needed") : st === "flagged" ? "Flagged" : "Skipped";
+    lines.push([status, x.folder || "", x.file || "", x.r.header ? x.r.header.name : "", x.r.code || "",
+      x.session || "", x.how || "", x.d.subjectId || "", x.r.barcode || "",
+      st === "ok" || (st === "session" && x.session) ? "" : x.d.reasons.join("; "), x.d.notes.join("; "), x.source, x.page]);
+  }
+  // UTF-8 BOM so Excel shows accented names correctly
+  return "﻿" + lines.map((l) => l.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+}
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function fmtTime(ms) { const s = Math.ceil(ms / 1000); return s < 60 ? `${s} seconds` : `${Math.ceil(s / 60)} minute${s > 60 ? "s" : ""}`; }
+function timestamp() {
+  const d = new Date(), p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}.${p(d.getMinutes())}`;
+}
+</script>
+</body>
+</html>
