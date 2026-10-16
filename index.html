@@ -128,7 +128,7 @@ footer { font-size: 0.85rem; color: var(--muted); }
 <div class="wrap">
   <header>
     <h1>Slate Sorter</h1>
-    <p>Reads scanned slates, checks each Subject ID against its barcode, and files every slate into its school code folder, then into a folder for its session type (YBK, ESS, POP, GRAD or OTHER). Everything stays on this computer.</p>
+    <p>Reads scanned slates, checks each Subject ID against its barcode, and files every slate into its school code folder, named with its session type (YBK, ESS, POP, GRAD or OTHER) and the student's name. Everything stays on this computer.</p>
   </header>
 
   <section class="step" id="step1">
@@ -149,7 +149,7 @@ footer { font-size: 0.85rem; color: var(--muted); }
   <section class="step" id="step2">
     <div class="num">2</div>
     <h2>Choose where to save</h2>
-    <p class="help" id="saveHelp">Pick a folder. A folder per school (with session folders and a 0_Flagged folder inside) is created in it, plus 0_Non_Contracted, 0_Prev_Seniors and 0_Flagged at the top when needed.</p>
+    <p class="help" id="saveHelp">Pick the same folder every time. A folder per school (with a 0_Flagged folder inside) is created in it, plus 0_Non_Contracted, 0_Prev_Seniors and 0_Flagged at the top when needed. A running log of every slate sorted into this folder is kept in it too.</p>
     <div class="body">
       <button type="button" id="pickFolder">Choose folder</button>
       <div class="picked" id="folderPicked">No folder chosen yet</div>
@@ -359,10 +359,10 @@ function makeWriter() {
       return d;
     };
     const writer = {
-      async write(folder, base, ext, bytes) {
+      async write(folder, base, ext, bytes, overwrite) {
         const d = await dirAt(folder, true);
         let name = `${base}.${ext}`, n = 2;
-        while (used.has(`${folder}/${name}`) || (await exists(d, name))) name = `${base} (${n++}).${ext}`;
+        while (!overwrite && (used.has(`${folder}/${name}`) || (await exists(d, name)))) name = `${base} (${n++}).${ext}`;
         used.add(`${folder}/${name}`);
         const fh = await d.getFileHandle(name, { create: true });
         const w = await fh.createWritable(); await w.write(bytes); await w.close();
@@ -376,6 +376,9 @@ function makeWriter() {
         used.delete(`${fromFolder}/${fromName}`);
         await removeIfEmpty(fromFolder);
         return name;
+      },
+      async readRoot(name) {
+        try { return await (await (await state.dir.getFileHandle(name)).getFile()).text(); } catch { return null; }
       },
       async writeRoot(name, bytes) {
         const fh = await state.dir.getFileHandle(name, { create: true });
@@ -395,10 +398,10 @@ function makeWriter() {
   }
   const files = {};
   return {
-    async write(folder, base, ext, bytes) {
+    async write(folder, base, ext, bytes, overwrite) {
       let name = `${base}.${ext}`, n = 2;
-      while (files[`${folder}/${name}`]) name = `${base} (${n++}).${ext}`;
-      files[`${folder}/${name}`] = [bytes, { level: 0 }];
+      while (!overwrite && files[`${folder}/${name}`]) name = `${base} (${n++}).${ext}`;
+      files[`${folder}/${name}`] = [bytes, { level: ext === "csv" ? 6 : 0 }];
       return name;
     },
     async move(fromFolder, fromName, toFolder, base, ext) {
@@ -432,9 +435,7 @@ function groupLabel(r) {
 }
 
 function targetFor(row, session) {
-  const code = homeOf(row.r);
-  const base = Core.fileBase(row.r, row.d, `page ${row.page}`);
-  return session ? { folder: `${code}/${session}`, base } : { folder: code, base: `${base} - ${NEEDED}` };
+  return { folder: homeOf(row.r), base: Core.fileBase(row.r, row.d, `page ${row.page}`, session || NEEDED) };
 }
 
 // ---------- reading the input, one page at a time ----------
@@ -455,18 +456,17 @@ async function* pagesOf(input) {
     } else {
       let page;
       try { page = await renderImage(bytes); } catch (e) { yield { label: name, error: "could not be opened as a picture" }; continue; }
-      yield { label: name, pageNo: 1, page, makePdf: () => imagePdf(bytes) };
+      yield { label: name, pageNo: 1, page };
     }
   }
 }
 
 async function* pdfPages(label, bytes) {
   const pdfjsDoc = await pdfjsLib.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise;
-  const libDoc = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
   try {
     for (let i = 0; i < pdfjsDoc.numPages; i++) {
       const page = await renderPdfPage(pdfjsDoc, i + 1);
-      yield { label, pageNo: i + 1, pageCount: pdfjsDoc.numPages, page, makePdf: () => singlePagePdf(libDoc, i) };
+      yield { label, pageNo: i + 1, pageCount: pdfjsDoc.numPages, page };
     }
   } finally { await pdfjsDoc.destroy(); }
 }
@@ -485,6 +485,8 @@ async function run() {
   const input = state.input;
   const writer = state.writer = makeWriter();
   const rows = state.rows = [];
+  state.stamp = timestamp();
+  await loadHistory();
   for (const name of input.others || []) rows.push({ source: name, page: "", r: {}, d: { status: "skipped", reasons: ["not a PDF, JPG or PNG file"], notes: [] } });
   // pages are known for a PDF; for a ZIP, count files and add any extra pages as they are found
   let total = input.kind === "pdf" ? input.pages : input.entries.length;
@@ -502,17 +504,22 @@ async function run() {
         const r = await Core.readSlate(item.page, engine);
         const d = Core.decide(r);
         const row = { source: item.label, page: item.pageNo, r, d, how: r.session && r.session.how || "" };
+        const seen = r.barcode && state.history.get(r.barcode);
+        if (seen) { row.seenBefore = seen.batch; d.notes.push(`already scanned in batch ${seen.batch} (${seen.where})`); }
         if (d.status !== "skipped") {
-          const out = await item.makePdf();
+          const out = await compactPdf(item.page);
+          row.kb = Math.round(out.length / 1024);
           const home = homeOf(r);
           const t = d.status === "flagged"
-            ? { folder: home ? `${home}/${FLAGGED}` : FLAGGED, base: Core.fileBase(r, d, `page ${item.pageNo}`) }
+            ? { folder: home ? `${home}/${FLAGGED}` : FLAGGED, base: Core.fileBase(r, d, `page ${item.pageNo}`, d.session) }
             : targetFor(row, d.session);
           row.folder = t.folder;
           row.file = await writer.write(t.folder, t.base, "pdf", out);
           row.session = d.session;
           if (d.status === "flagged") row.preview = previewOf(item.page, !d.session);
           if (d.status === "session") row.shots = reviewShots(item.page);
+          // later pages with the same barcode in this batch are pointed out too
+          if (r.barcode && !state.history.has(r.barcode)) state.history.set(r.barcode, { batch: state.stamp, where: `${row.folder}/${row.file}` });
         }
         rows.push(row);
       }
@@ -531,7 +538,6 @@ async function run() {
     $("progress").hidden = true;
   }
 
-  state.stamp = timestamp();
   if (pending().length) {
     $("startHelp").textContent = "Reading finished. Pick the session type for the slates that need one.";
     await review(pending());
@@ -546,10 +552,43 @@ function stayOpen(e) { e.preventDefault(); e.returnValue = ""; }
 
 const pending = () => state.rows.filter((x) => x.d.status === "session" && !x.session);
 
-// spreadsheet (and ZIP) reflect the latest choices; safe to run again after more choices
+// Batch report in 0_Reports, plus the running log at the top of the save folder.
+// Safe to run again after more session picks: this batch's rows in the log are replaced, not duplicated.
+const LOG_NAME = "Slate Sorter log.csv";
 async function finalize() {
-  await state.writer.writeRoot(`Slate Sorter results ${state.stamp}.csv`, new TextEncoder().encode(toCsv(state.rows)));
+  const enc = (t) => new TextEncoder().encode(t);
+  await state.writer.write("0_Reports", `Slate Sorter batch ${state.stamp}`, "csv", enc(toCsv(state.rows)), true);
+  if (state.writer.readRoot) {
+    const old = parseCsv((await state.writer.readRoot(LOG_NAME)) || "");
+    const header = LOG_HEAD;
+    const keep = [];
+    if (old.length) {
+      const h = old[0], bi = h.indexOf("Batch");
+      for (const row of old.slice(1)) {
+        if (bi >= 0 && row[bi] === state.stamp) continue;          // replaced below
+        keep.push(header.map((col) => { const i = h.indexOf(col); return i >= 0 ? row[i] : ""; }));
+      }
+    }
+    const mine = logRows(state.rows);
+    await state.writer.writeRoot(LOG_NAME, enc(csvText([header, ...keep, ...mine])));
+    state.logCount = keep.length + mine.length;
+  }
   return state.writer.finish(state.stamp);
+}
+
+// slates already in the running log, by barcode, so a re-scan is pointed out
+async function loadHistory() {
+  state.history = new Map();
+  if (!state.writer.readRoot) return;
+  try {
+    const rows = parseCsv((await state.writer.readRoot(LOG_NAME)) || "");
+    if (!rows.length) return;
+    const h = rows[0], bc = h.indexOf("Barcode"), bt = h.indexOf("Batch"), fo = h.indexOf("Folder"), fi = h.indexOf("File");
+    for (const r of rows.slice(1)) {
+      const code = unwrap(r[bc] || "");
+      if (code && !state.history.has(code)) state.history.set(code, { batch: r[bt], where: `${r[fo]}/${r[fi]}` });
+    }
+  } catch (e) { console.error("could not read the log", e); }
 }
 
 async function renderPdfPage(doc, n) {
@@ -577,20 +616,29 @@ async function renderImage(bytes) {
   return { data: img.data, width: w, height: h };
 }
 
-async function singlePagePdf(src, index) {
-  const doc = await PDFLib.PDFDocument.create();
-  const [p] = await doc.copyPages(src, [index]);
-  doc.addPage(p);
-  return doc.save();
-}
-
-async function imagePdf(bytes) {
-  const doc = await PDFLib.PDFDocument.create();
-  const isPng = bytes[0] === 0x89 && bytes[1] === 0x50;
-  const img = isPng ? await doc.embedPng(bytes) : await doc.embedJpg(bytes);
-  const w = 612, h = (img.height / img.width) * w;
-  doc.addPage([w, h]).drawImage(img, { x: 0, y: 0, width: w, height: h });
-  return doc.save();
+// One slate as a one-page PDF no bigger than MAX_BYTES: a JPEG at 200 dpi, stepping down only if needed.
+const MAX_BYTES = 500 * 1000;
+const STEPS = [[200, 0.8], [200, 0.7], [170, 0.7], [150, 0.65], [130, 0.6], [110, 0.55]];
+async function compactPdf(page) {
+  const src = toCanvas(page);
+  const widthIn = page.width / DPI, heightIn = page.height / DPI;
+  let out = null;
+  for (const [dpi, q] of STEPS) {
+    const c = document.createElement("canvas");
+    c.width = Math.round(widthIn * dpi); c.height = Math.round(heightIn * dpi);
+    const ctx = c.getContext("2d");
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, c.width, c.height);
+    const jpg = new Uint8Array(await (await new Promise((res) => c.toBlob(res, "image/jpeg", q))).arrayBuffer());
+    c.width = c.height = 0;
+    const doc = await PDFLib.PDFDocument.create();
+    const img = await doc.embedJpg(jpg);
+    doc.addPage([widthIn * 72, heightIn * 72]).drawImage(img, { x: 0, y: 0, width: widthIn * 72, height: heightIn * 72 });
+    out = await doc.save();
+    if (out.length <= MAX_BYTES) break;
+  }
+  src.width = src.height = 0;
+  return out;
 }
 
 function previewOf(page, withSession) {
@@ -700,10 +748,11 @@ function showResults(message, failed) {
   [...ok, ...need].forEach((x) => { const g = groupLabel(x.r); (bySchool[g] = bySchool[g] || []).push(x); });
   const schools = Object.keys(bySchool).sort();
   const order = (x) => (x.session ? Core.SESSION_CHOICES.indexOf(x.session) : 99);
+  const again = slates.filter((x) => x.seenBefore);
 
   const el = $("results");
   el.innerHTML = `
-    <div class="saved${failed ? " bad" : ""}">${esc(message)}</div>
+    <div class="saved${failed ? " bad" : ""}">${esc(message)}${state.logCount ? ` The running log (${LOG_NAME}) now lists ${state.logCount} slate${state.logCount === 1 ? "" : "s"}.` : state.zip ? " The running log is only kept when saving into a folder." : ""}</div>
     ${state.zip ? `<div><button type="button" class="primary big" id="saveZip">Save the sorted slates</button> <span class="note" id="zipNote"></span></div>` : ""}
     <div class="summary">
       <div class="tile ok"><b>${ok.length}</b>sorted into ${new Set(ok.map((x) => groupLabel(x.r))).size} folder${new Set(ok.map((x) => groupLabel(x.r))).size === 1 ? "" : "s"}</div>
@@ -711,8 +760,13 @@ function showResults(message, failed) {
       <div class="tile flag"><b>${flagged.length}</b>flagged for checking</div>
       <div class="tile"><b>${skipped.length}</b>page${skipped.length === 1 ? "" : "s"} or file${skipped.length === 1 ? "" : "s"} skipped</div>
     </div>
+    ${again.length ? `<div class="panel"><h3>Scanned before</h3>
+      <p class="meta" style="margin:0">These barcodes are already in the running log from an earlier batch. They were sorted again; check whether the earlier copy should be removed.</p>
+      <div class="tablewrap"><table><thead><tr><th>New file</th><th>Earlier batch</th><th>Earlier file</th></tr></thead><tbody>
+      ${again.map((x) => `<tr><td>${esc(x.folder)}/${esc(x.file)}</td><td>${esc(x.seenBefore)}</td><td>${esc(state.history.get(x.r.barcode).where)}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}
     ${need.length ? `<div class="panel"><h3>Still need a session type</h3>
-      <p class="meta" style="margin:0">These are in their school (or group) folder, named “… - ${NEEDED}”. Pick the session now, or later by moving the file into the right session folder yourself.</p>
+      <p class="meta" style="margin:0">These are in their school (or group) folder, named like “ATM - ${NEEDED} - Davey Arias”. Pick the session now, or later by moving the file into the right session folder yourself.</p>
       <div><button type="button" class="primary" id="pickNow">Pick session types now (${need.length})</button></div>
       <div class="tablewrap"><table><thead><tr><th>Folder</th><th>File</th><th>Why</th></tr></thead><tbody>
       ${need.map((x) => `<tr><td>${esc(groupLabel(x.r))}</td><td>${esc(x.file)}</td><td>${esc(x.d.reasons[0] || "")}</td></tr>`).join("")}
@@ -762,25 +816,57 @@ async function saveZip() {
   note.textContent = `Saved as “${name}” in your Downloads folder.`;
 }
 
-function toCsv(rows) {
-  const head = ["Result", "Folder", "File", "Student", "School code", "Group", "Session type", "Session decided by", "Subject ID on slate", "Barcode", "Why flagged or skipped", "Notes", "Source file", "Page"];
-  const lines = [head];
-  for (const x of rows) {
-    const st = x.d.status;
-    const status = st === "ok" ? "Sorted" : st === "session" ? (x.session ? "Sorted" : "Sorted - session needed") : st === "flagged" ? "Flagged" : "Skipped";
-    lines.push([status, x.folder || "", x.file || "", x.r.header ? x.r.header.name : "", x.r.code || "", (x.r.category && x.r.category.label) || "",
-      x.session || "", x.how || "", x.d.subjectId || "", x.r.barcode || "",
-      st === "ok" || (st === "session" && x.session) ? "" : x.d.reasons.join("; "), x.d.notes.join("; "), x.source, x.page]);
-  }
+const LOG_HEAD = ["Batch", "Result", "Folder", "File", "Student", "School code", "Group", "Session type", "Session decided by",
+  "Subject ID on slate", "Barcode", "Why flagged or skipped", "Notes", "Scanned before in batch", "Source file", "Page", "File size KB"];
+
+function csvRow(x) {
+  const st = x.d.status;
+  const status = st === "ok" ? "Sorted" : st === "session" ? (x.session ? "Sorted" : "Sorted - session needed") : st === "flagged" ? "Flagged" : "Skipped";
+  return [state.stamp, status, x.folder || "", x.file || "", x.r.header ? x.r.header.name : "", x.r.code || "",
+    (x.r.category && x.r.category.label) || "", x.session || "", x.how || "", wrap(x.d.subjectId), wrap(x.r.barcode),
+    st === "ok" || (st === "session" && x.session) ? "" : x.d.reasons.join("; "), x.d.notes.join("; "), x.seenBefore || "",
+    x.source, x.page, x.kb || ""];
+}
+// every page and file, for this batch's report
+function toCsv(rows) { return csvText([LOG_HEAD, ...rows.map(csvRow)]); }
+// slates only (no back pages or skipped files), for the running log
+function logRows(rows) { return rows.filter((x) => x.d.status !== "skipped").map(csvRow); }
+
+// IDs as ="0943924" so Excel keeps the leading zeros
+function wrap(v) { return v ? `="${v}"` : ""; }
+function unwrap(v) { return String(v).replace(/^="?|"$/g, ""); }
+
+function csvText(lines) {
   // UTF-8 BOM so Excel shows accented names correctly
-  return "﻿" + lines.map((l) => l.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+  return "\ufeff" + lines.map((l) => l.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n") + "\r\n";
+}
+
+function parseCsv(text) {
+  text = text.replace(/^\ufeff/, "");
+  const rows = []; let row = [], field = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
+      else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(field); field = "";
+      if (row.length > 1 || row[0] !== "") rows.push(row);
+      row = [];
+    } else field += c;
+  }
+  if (field !== "" || row.length) { row.push(field); rows.push(row); }
+  return rows;
 }
 
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 function fmtTime(ms) { const s = Math.ceil(ms / 1000); return s < 60 ? `${s} seconds` : `${Math.ceil(s / 60)} minute${s > 60 ? "s" : ""}`; }
 function timestamp() {
   const d = new Date(), p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}.${p(d.getMinutes())}`;
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}.${p(d.getMinutes())}.${p(d.getSeconds())}`;
 }
 </script>
 </body>

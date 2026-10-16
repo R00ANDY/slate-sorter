@@ -369,12 +369,13 @@
   }
 
   // "ATM - Jordan Alvarez.pdf"
-  function fileBase(r, d, fallback) {
+  // "ATM - YBK - Davey Arias"; the session part is left out when there is none
+  function fileBase(r, d, fallback, session) {
     const short = { NONCON: "Non-Contracted", PREV: "Prev Senior" };
     const code = cleanName(r.code) || (r.category && short[r.category.key]) || "NO CODE";
     const person = cleanName(`${r.header ? r.header.first : ""} ${r.header ? r.header.last : ""}`)
       || `ID ${d.subjectId || r.barcode || fallback}`;
-    return `${code} - ${person}`;
+    return session ? `${code} - ${session} - ${person}` : `${code} - ${person}`;
   }
 
   const api = { CATEGORIES, findCategory, SESSIONS, SESSION_CODES, SESSION_CHOICES, crop, gray, threshold, scale, pad, redInk, parseHeader, readSlate, decide, fileBase, cleanName };
