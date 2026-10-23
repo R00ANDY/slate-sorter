@@ -149,7 +149,7 @@ footer { font-size: 0.85rem; color: var(--muted); }
   <section class="step" id="step2">
     <div class="num">2</div>
     <h2>Choose where to save</h2>
-    <p class="help" id="saveHelp">Pick the same folder every time. A folder per school (with a 0_Flagged folder inside) is created in it, plus 0_Non_Contracted, 0_Prev_Seniors and 0_Flagged at the top when needed. A running log of every slate sorted into this folder is kept in it too.</p>
+    <p class="help" id="saveHelp">Pick the same folder every time. Inside it each school gets a folder, with a folder per graduation year (for example MIASR/2027). Retake and In-School slates go into Retake and In School folders inside the year folder. Non-Contracted and Previous Seniors slates go to 0_Non_Contracted, and slates whose school can't be read go to 0_Flagged. A running log of every slate sorted into this folder is kept in it too.</p>
     <div class="body">
       <button type="button" id="pickFolder">Choose folder</button>
       <div class="picked" id="folderPicked">No folder chosen yet</div>
@@ -191,7 +191,7 @@ footer { font-size: 0.85rem; color: var(--muted); }
     </div>
   </div>
 
-  <footer>Non-Contracted Seniors and Previous Seniors slates go into the <b>0_Non_Contracted</b> and <b>0_Prev_Seniors</b> folders. Slates with a missing or mismatched Subject ID go into a <b>0_Flagged</b> folder inside their school folder (or at the top when the school can't be read) for a person to check. Slates where only the session type is unclear stay in their school folder, and you can pick the session type when the scan finishes. A results spreadsheet is saved alongside the folders.</footer>
+  <footer>Slates with a missing or mismatched Subject ID, or no readable graduation year, go into a <b>0_Flagged</b> folder inside their school's year folder (or higher up when the year or school can't be read) for a person to check. Students already sorted before go to <b>0_Duplicate</b>, except Retake and In-School slates. Slates where only the session type is unclear stay in their school folder, and you can pick the session type when the scan finishes. A results spreadsheet is saved alongside the folders.</footer>
 </div>
 
 <script src="lib/tesseract.min.js"></script>
@@ -211,7 +211,16 @@ ZXingWASM.setZXingModuleOverrides({
 });
 
 const DPI = 300;
-const FLAGGED = "0_Flagged";   // inside each school folder; at the top level only when the school is unknown
+// Layout:  <SCHOOL>/<YEAR>/            regular slates
+//          <SCHOOL>/<YEAR>/Retake/     slates with the RETAKES watermark (never treated as duplicates)
+//          <SCHOOL>/<YEAR>/In School/  In-School slates (never treated as duplicates)
+//          <SCHOOL>/<YEAR>/0_Duplicate/  barcode already sorted before
+//          <SCHOOL>/<YEAR>/0_Flagged/    needs a person (year unknown: <SCHOOL>/0_Flagged)
+//          0_Non_Contracted/           Non-Contracted and Previous Seniors (no year)
+//          0_Flagged/                  school couldn't be determined
+const FLAGGED = "0_Flagged";
+const DUPLICATE = "0_Duplicate";
+const KIND_FOLDER = { retake: "Retake", inschool: "In School" };
 const state = { input: null, dir: null, zipMode: false, running: false, rows: [], writer: null, stamp: "" };
 const NEEDED = "SESSION NEEDED";
 
@@ -434,8 +443,24 @@ function groupLabel(r) {
   return r.category && r.category.folder ? r.category.label : (r.code || "");
 }
 
+// where a slate that passed its checks belongs: school folder, or its Retake / Duplicate folder
+// school (or group) folder plus year folder; the year is skipped for Non-Contracted / Previous Seniors
+function baseOf(r) {
+  const home = homeOf(r);
+  return r.category || !r.year ? home : `${home}/${r.year}`;
+}
+function flaggedFolder(r) {
+  const home = homeOf(r);
+  return home ? `${baseOf(r)}/${FLAGGED}` : FLAGGED;
+}
+function placeOf(row) {
+  const home = baseOf(row.r);
+  if (KIND_FOLDER[row.r.kind]) return `${home}/${KIND_FOLDER[row.r.kind]}`;
+  if (row.seenBefore) return `${home}/${DUPLICATE}`;
+  return home;
+}
 function targetFor(row, session) {
-  return { folder: homeOf(row.r), base: Core.fileBase(row.r, row.d, `page ${row.page}`, session || NEEDED) };
+  return { folder: placeOf(row), base: Core.fileBase(row.r, row.d, `page ${row.page}`, session || NEEDED) };
 }
 
 // ---------- reading the input, one page at a time ----------
@@ -505,19 +530,20 @@ async function run() {
         const d = Core.decide(r);
         const row = { source: item.label, page: item.pageNo, r, d, how: r.session && r.session.how || "" };
         const seen = r.barcode && state.history.get(r.barcode);
-        if (seen) { row.seenBefore = seen.batch; d.notes.push(`already scanned in batch ${seen.batch} (${seen.where})`); }
+        if (seen) { row.seenBefore = seen.batch; row.seenWhere = seen.where; d.notes.push(`already scanned in batch ${seen.batch} (${seen.where})`); }
+        if (r.kind === "retake") d.notes.push("RETAKE slate");
+        if (r.kind === "inschool") d.notes.push("In-School slate");
         if (d.status !== "skipped") {
           const out = await compactPdf(item.page);
           row.kb = Math.round(out.length / 1024);
-          const home = homeOf(r);
           const t = d.status === "flagged"
-            ? { folder: home ? `${home}/${FLAGGED}` : FLAGGED, base: Core.fileBase(r, d, `page ${item.pageNo}`, d.session) }
+            ? { folder: flaggedFolder(r), base: Core.fileBase(r, d, `page ${item.pageNo}`, d.session) }
             : targetFor(row, d.session);
           row.folder = t.folder;
           row.file = await writer.write(t.folder, t.base, "pdf", out);
           row.session = d.session;
           if (d.status === "flagged") row.preview = previewOf(item.page, !d.session);
-          if (d.status === "session") row.shots = reviewShots(item.page);
+          if (d.status === "session") row.shots = reviewShots(item.page, r.layout);
           // later pages with the same barcode in this batch are pointed out too
           if (r.barcode && !state.history.has(r.barcode)) state.history.set(r.barcode, { batch: state.stamp, where: `${row.folder}/${row.file}` });
         }
@@ -649,9 +675,10 @@ function previewOf(page, withSession) {
 }
 
 // close-ups for the session pop-up: the printed name, and the session type list with its neighbours
-function reviewShots(page) {
-  const name = Core.crop(page, 0.02, 0.012, 0.52, 0.062);
-  const sess = Core.crop(page, 0.30, 0.365, 0.80, 0.545);
+function reviewShots(page, layout) {
+  const name = layout === "B" ? Core.crop(page, 0.02, 0.027, 0.52, 0.072) : Core.crop(page, 0.02, 0.012, 0.52, 0.062);
+  // form B (In-School / Non-Contracted) has its session checkboxes further right
+  const sess = layout === "B" ? Core.crop(page, 0.45, 0.37, 0.97, 0.54) : Core.crop(page, 0.30, 0.365, 0.80, 0.545);
   return {
     name: toCanvas(Core.scale(name, 720 / name.width)).toDataURL("image/jpeg", 0.85),
     session: toCanvas(Core.scale(sess, Math.min(1, 1100 / sess.width))).toDataURL("image/jpeg", 0.88),
@@ -680,7 +707,7 @@ function review(list) {
       $("rvWho").textContent = `${x.r.header.first} ${x.r.header.last}`.trim() || "Name not read";
       $("rvName").src = x.shots.name; $("rvName").alt = `Printed name on the slate: ${x.r.header.name}`;
       $("rvShot").src = x.shots.session; $("rvShot").alt = "Close-up of the session type area of the slate";
-      $("rvInfo").innerHTML = `${x.r.category && x.r.category.folder ? `<b>${esc(x.r.category.label)}</b> · ` : ""}School <b>${esc(x.r.code || "not read")}</b> · Subject ID <b>${esc(x.d.subjectId)}</b> · ${esc(x.d.reasons[0] || "")}`;
+      $("rvInfo").innerHTML = `${x.r.category && x.r.category.folder ? `<b>${esc(x.r.category.label)}</b> · ` : ""}${x.r.category ? "" : `School <b>${esc(x.r.code || "not read")}</b> · `}${x.r.year ? `Year <b>${esc(x.r.year)}</b> · ` : ""}Subject ID <b>${esc(x.d.subjectId)}</b> · ${esc(x.d.reasons[0] || "")}`;
       $("rvChoices").querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.choice === x.session)));
       $("rvBack").disabled = i === 0;
       $("rvChoices").querySelector("button").focus();
@@ -748,7 +775,8 @@ function showResults(message, failed) {
   [...ok, ...need].forEach((x) => { const g = groupLabel(x.r); (bySchool[g] = bySchool[g] || []).push(x); });
   const schools = Object.keys(bySchool).sort();
   const order = (x) => (x.session ? Core.SESSION_CHOICES.indexOf(x.session) : 99);
-  const again = slates.filter((x) => x.seenBefore);
+  const again = slates.filter((x) => x.seenBefore && !KIND_FOLDER[x.r.kind] && x.d.status !== "flagged");
+  const retakes = slates.filter((x) => KIND_FOLDER[x.r.kind] && x.d.status !== "flagged");
 
   const el = $("results");
   el.innerHTML = `
@@ -760,10 +788,15 @@ function showResults(message, failed) {
       <div class="tile flag"><b>${flagged.length}</b>flagged for checking</div>
       <div class="tile"><b>${skipped.length}</b>page${skipped.length === 1 ? "" : "s"} or file${skipped.length === 1 ? "" : "s"} skipped</div>
     </div>
-    ${again.length ? `<div class="panel"><h3>Scanned before</h3>
-      <p class="meta" style="margin:0">These barcodes are already in the running log from an earlier batch. They were sorted again; check whether the earlier copy should be removed.</p>
-      <div class="tablewrap"><table><thead><tr><th>New file</th><th>Earlier batch</th><th>Earlier file</th></tr></thead><tbody>
-      ${again.map((x) => `<tr><td>${esc(x.folder)}/${esc(x.file)}</td><td>${esc(x.seenBefore)}</td><td>${esc(state.history.get(x.r.barcode).where)}</td></tr>`).join("")}
+    ${again.length ? `<div class="panel"><h3>Duplicates (${again.length})</h3>
+      <p class="meta" style="margin:0">These barcodes were already sorted, in an earlier batch or earlier in this one. Each new copy is in its school's <b>${DUPLICATE}</b> folder; the first copy was left where it was.</p>
+      <div class="tablewrap"><table><thead><tr><th>Duplicate saved as</th><th>First copy</th><th>First batch</th></tr></thead><tbody>
+      ${again.map((x) => `<tr><td>${esc(x.folder)}/${esc(x.file)}</td><td>${esc(x.seenWhere)}</td><td>${esc(x.seenBefore)}</td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}
+    ${retakes.length ? `<div class="panel"><h3>Retake and In-School slates (${retakes.length})</h3>
+      <p class="meta" style="margin:0">These are in the <b>Retake</b> or <b>In School</b> folder inside their school's year folder, even when the student was scanned before.</p>
+      <div class="tablewrap"><table><thead><tr><th>Type</th><th>Saved as</th><th>Scanned before</th></tr></thead><tbody>
+      ${retakes.map((x) => `<tr><td>${esc(KIND_FOLDER[x.r.kind])}</td><td>${esc(x.folder)}/${esc(x.file)}</td><td>${esc(x.seenBefore || "no")}</td></tr>`).join("")}
       </tbody></table></div></div>` : ""}
     ${need.length ? `<div class="panel"><h3>Still need a session type</h3>
       <p class="meta" style="margin:0">These are in their school (or group) folder, named like “ATM - ${NEEDED} - Davey Arias”. Pick the session now, or later by moving the file into the right session folder yourself.</p>
@@ -816,15 +849,15 @@ async function saveZip() {
   note.textContent = `Saved as “${name}” in your Downloads folder.`;
 }
 
-const LOG_HEAD = ["Batch", "Result", "Folder", "File", "Student", "School code", "Group", "Session type", "Session decided by",
-  "Subject ID on slate", "Barcode", "Why flagged or skipped", "Notes", "Scanned before in batch", "Source file", "Page", "File size KB"];
+const LOG_HEAD = ["Batch", "Result", "Folder", "File", "Student", "School code", "Session type", "Session decided by",
+  "Subject ID on slate", "Barcode", "Why flagged or skipped", "Notes", "Slate type", "Graduation year", "Scanned before in batch", "Source file", "Page", "File size KB"];
 
 function csvRow(x) {
   const st = x.d.status;
   const status = st === "ok" ? "Sorted" : st === "session" ? (x.session ? "Sorted" : "Sorted - session needed") : st === "flagged" ? "Flagged" : "Skipped";
   return [state.stamp, status, x.folder || "", x.file || "", x.r.header ? x.r.header.name : "", x.r.code || "",
-    (x.r.category && x.r.category.label) || "", x.session || "", x.how || "", wrap(x.d.subjectId), wrap(x.r.barcode),
-    st === "ok" || (st === "session" && x.session) ? "" : x.d.reasons.join("; "), x.d.notes.join("; "), x.seenBefore || "",
+    x.session || "", x.how || "", wrap(x.d.subjectId), wrap(x.r.barcode),
+    st === "ok" || (st === "session" && x.session) ? "" : x.d.reasons.join("; "), x.d.notes.join("; "), { retake: "Retake", inschool: "In School", noncon: "Non-Contracted / Previous Seniors", regular: "Regular" }[x.r.kind] || "", x.r.year || "", x.seenBefore || "",
     x.source, x.page, x.kb || ""];
 }
 // every page and file, for this batch's report

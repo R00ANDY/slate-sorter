@@ -126,8 +126,13 @@
       m = l.match(/Job\s*Name\s*:\s*(.+)/i);
       if (m) out.job = m[1].replace(/^[\s|_]+|[\s|_]+$/g, "");
       // the colon after "Subject ID" (OCR often turns "ID" into "1D" or "I1D")
-      m = l.match(/Subject[^:;]{0,6}[:;](.*?)(Class|$)/i) || l.match(/Subject\s*[I1l|]*D(.*?)(Class|$)/i);
-      if (m) { out.subjectOcr = digitsOnly(m[1]); out.subjectLineFound = true; }
+      m = l.match(/(?:Subject|Student)[^:;]{0,6}[:;](.*?)(Class|$)/i) || l.match(/(?:Subject|Student)\s*[I1l|]*D(.*?)(Class|$)/i);
+      if (m) {
+        // first run of digits after the label (form B has the cell phone number further along the same line)
+        const first = m[1].match(/[0-9OoQDIlL|!S]{4,}/);
+        out.subjectOcr = first ? digitsOnly(first[0]) : "";
+        out.subjectLineFound = true;
+      }
     }
     for (const l of lines) {
       if (/school/i.test(l)) break;
@@ -160,12 +165,26 @@
       if (vals.length > 1) { r.barcodeNote = "more than one barcode: " + vals.join(", "); break; }
     }
 
-    // 2. header block
-    const head = gray(crop(page, 0, 0, 0.56, 0.24));
+    // 2. header block (watermark tints removed first)
+    r.marks = watermarks(crop(page, 0, 0, 1, 0.24));
+    const head = gray(withoutTints(crop(page, 0, 0, 0.56, 0.24)));
     const h = await engine.ocr(head, { psm: "6" });
     r.header = parseHeader(h.text);
     r.headerImage = head;
-    r.category = findCategory(h.text);
+    // form B (In-School / Non-Contracted) has language boxes and "Student ID"; form A has "Subject ID" and the studio box
+    r.layout = /student\s*[i1l|]?d/i.test(h.text) || /english|spanish|creole/i.test(h.text) ? "B" : "A";
+    // Job Name is printed in red under the (red) student name: read that red line on its own for the year
+    // (stops at x 0.52, before the red border of the studio box on form A)
+    r.jobText = await readJobLine(withoutTints(crop(page, 0, 0, 0.52, 0.24)), engine);
+    const yearIn = (t) => { const m = (t || "").replace(/(\d)[:.,' ](?=\d)/g, "$1").match(/\b(20\d\d)\b/); return m ? m[1] : ""; };
+    const y1 = yearIn(r.jobText), y2 = yearIn(r.header.job);
+    r.year = y1 && y2 && y1 !== y2 ? "" : y1 || y2;
+    r.yearNote = y1 && y2 && y1 !== y2 ? `graduation year unclear (Job Name read as ${y1} and ${y2})` : "";
+    r.category = findCategory(`${h.text}\n${r.jobText}`) || (r.layout === "B" && r.marks.blue >= TINT_MIN ? NONCON : null);
+    r.kind = r.category ? "noncon"
+      : r.marks.pink >= TINT_MIN || isRetake(h.text) ? "retake"
+      : r.layout === "B" ? "inschool" : "regular";
+
     if (!r.barcode && !r.header.subjectLineFound && !r.header.school) {
       r.isSlate = false;
       return r;
@@ -189,17 +208,20 @@
     if (line) {
       const second = await readDigits(engine, scale(line, 2));
       if (second) r.reads.push(second);
-      if (new Set(r.reads).size > 1) {
+      // a third, differently prepared read when the reads disagree or none of them matches the barcode yet
+      if (new Set(r.reads).size > 1 || (r.barcode && !r.reads.includes(r.barcode))) {
         const third = await readDigits(engine, threshold(scale(line, 3), 150));
         if (third) r.reads.push(third);
       }
     }
 
     // 4. session type (highlighted, circled or checked)
-    r.session = await readSession(page, engine);
+    r.session = await readSession(page, engine, r.layout);
+    if (r.kind === "regular" && isRetake(r.session.areaText)) r.kind = "retake";
+    r.retake = r.kind === "retake";
 
-    // 5. red school code
-    const ink = redInk(crop(page, 0.62, 0.185, 0.92, 0.245));
+    // 5. red school code: in the studio box on form A, in the box under Online Engagement on form B
+    const ink = redInk(r.layout === "B" ? crop(page, 0.68, 0.475, 0.945, 0.54) : crop(page, 0.62, 0.185, 0.92, 0.245));
     if (ink) {
       const c = await engine.ocr(ink, { psm: "7", whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ" });
       r.code = c.text.replace(/[^A-Z]/g, "");
@@ -209,15 +231,39 @@
 
   // ---------- session type ----------
   // special slate groups, found by wording anywhere in the header block (name, School, Job Name, Subject ID lines)
-  const CATEGORIES = [
-    { key: "NONCON", label: "Non-Contracted Seniors", folder: "0_Non_Contracted", re: /n[o0]n[^a-z0-9]{0,3}c[o0]n[t+f]ra/ },
-    { key: "PREV", label: "Previous Seniors", folder: "0_Prev_Seniors", re: /prev(i[o0]us)?[^a-z0-9]{0,3}s[e3]n[i1l]{1,2}[o0]r/ },
-  ];
+  // Non-Contracted and Previous Seniors slates share one form and one folder
+  const NONCON = { key: "NONCON", label: "Non-Contracted / Previous Seniors", folder: "0_Non_Contracted" };
+  const CATEGORIES = [NONCON];
+  const NONCON_TEXT = [/n[o0]n[^a-z0-9]{0,3}c[o0]n[t+f]ra/, /prev(i[o0]us)?[^a-z0-9]{0,3}s[e3]n[i1l]{1,2}[o0]r/];
   function findCategory(text) {
     const t = (text || "").toLowerCase();
-    const hits = CATEGORIES.filter((c) => c.re.test(t));
-    return hits.length === 1 ? hits[0] : hits.length > 1 ? { key: "BOTH", label: "both Non-Contracted and Previous Seniors" } : null;
+    return NONCON_TEXT.some((re) => re.test(t)) ? NONCON : null;
   }
+
+  // ---------- watermarks ----------
+  // Pale tints printed across the top of special slates:
+  //   lavender "IN-SCHOOL", light blue "NON-CONTRACTED SCHOOL", light red "RETAKES".
+  function tintOf(R, G, B) {
+    if (B >= 232 && R >= 222 && R <= 252 && G >= 205 && G <= 238 && R - G >= 6 && B - G >= 14) return 1;    // lavender
+    if (B >= 232 && R >= 205 && R <= 238 && G - R >= 3 && B - R >= 14) return 2;                           // light blue
+    if (R >= 232 && G >= 150 && G <= 222 && B >= 150 && B <= 222 && R - G >= 28 && Math.abs(G - B) <= 22) return 3; // light red
+    return 0;
+  }
+  function watermarks(img) {
+    const d = img.data, n = d.length / 4, c = [0, 0, 0, 0];
+    for (let i = 0; i < d.length; i += 4) c[tintOf(d[i], d[i + 1], d[i + 2])]++;
+    return { lavender: c[1] / n, blue: c[2] / n, pink: c[3] / n };
+  }
+  // the same picture with watermark tints turned white, so they don't disturb text reading
+  function withoutTints(img) {
+    const out = { data: new Uint8ClampedArray(img.data), width: img.width, height: img.height }, d = out.data;
+    for (let i = 0; i < d.length; i += 4) if (tintOf(d[i], d[i + 1], d[i + 2])) d[i] = d[i + 1] = d[i + 2] = 255;
+    return out;
+  }
+  const TINT_MIN = 0.04;   // share of the header band a watermark covers (samples: 0.12–0.29; normal slates under 0.01)
+
+  // "RETAKE" printed on the slate (allowing common misreads such as 3 for E or 4 for A)
+  const isRetake = (text) => /\br[e3]t[a4]k[e3]s?\b/i.test(text || "");
 
   const SESSIONS = ["Yearbook", "Essentials", "Popular", "Graduate", "VIP"];
   // folder names, matching the choices offered when a person picks the session by hand
@@ -230,9 +276,10 @@
    *  highlight = share of coloured pixels on the word's own line (highlighter of any colour)
    *  pen       = share of ink around the word, with the printed word blanked out (circles, checks, underlines)
    * Highlight decides first; pen is used only when nothing is highlighted. */
-  async function readSession(page, engine) {
-    const reg = crop(page, 0.305, 0.37, 0.55, 0.54);
+  async function readSession(page, engine, layout) {
+    const reg = layout === "B" ? crop(page, 0.52, 0.395, 0.70, 0.515) : crop(page, 0.305, 0.37, 0.55, 0.54);
     const o = await engine.ocr(gray(reg), { psm: "6" });
+    const areaText = o.text;
     const found = {};
     for (const w of o.words) {
       const t = w.text.trim().toLowerCase().slice(0, 4);
@@ -241,7 +288,7 @@
       });
     }
     const f = Object.entries(found);
-    if (f.length < 2) return { choice: "", note: "session type area could not be found" };
+    if (f.length < 2) return { choice: "", note: "session type area could not be found", areaText };
 
     // rows are evenly spaced: fit centre-y = a + b * rowIndex
     const pts = f.map(([, v]) => [v.k, (v.y0 + v.y1) / 2]);
@@ -280,41 +327,139 @@
       for (let y = yA; y < yB; y++) for (let x = xA; x < xB; x++) { c += m[y * W + x]; t++; }
       return t ? c / t : 0;
     };
-    const hl = {}, pen = {};
-    SESSIONS.forEach((nm, k) => {
-      const cy = a + b * k;
+    const rows = layout === "B" ? SESSIONS.filter((s) => s !== "VIP") : SESSIONS;
+    const hl = {}, pen = {}, box = {};
+    rows.forEach((nm) => {
+      const cy = a + b * SESSIONS.indexOf(nm);
       hl[nm] = share(color, cy - 0.3 * b, cy + 0.3 * b, x0 - 1.5 * hh, xr);
-      pen[nm] = share(ink, cy - 0.5 * b, cy + 0.5 * b, x0 - 3 * hh, xr);
+      // on form B the checkbox outlines sit left of the words, so pen marks are measured from the word onward
+      pen[nm] = share(ink, cy - 0.5 * b, cy + 0.5 * b, layout === "B" ? x0 + 0.1 * hh : x0 - 3 * hh, xr);
+      if (layout === "B") box[nm] = boxFill(cy);
     });
-    for (const [scores, min, how] of [[hl, 0.12, "highlighted"], [pen, 0.015, "pen mark"]]) {
+    // form B: ink inside the checkbox left of each word (outline excluded)
+    function boxFill(cy) {
+      const zx0 = Math.max(0, Math.round(x0 - 2.3 * hh)), zx1 = Math.max(0, Math.round(x0 - 0.1 * hh));
+      const zy0 = Math.max(0, Math.round(cy - 0.95 * hh)), zy1 = Math.min(H, Math.round(cy + 0.95 * hh));
+      let bx0 = W, bx1 = -1, by0 = H, by1 = -1;
+      for (let y = zy0; y < zy1; y++) for (let x = zx0; x < zx1; x++) {
+        const i = (y * W + x) * 4;
+        if (Math.min(d[i], d[i + 1], d[i + 2]) < 150) { if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y; }
+      }
+      if (bx1 < 0 || bx1 - bx0 < 0.6 * hh) return 0;
+      const ix = (bx1 - bx0) * 0.2, iy = (by1 - by0) * 0.2;
+      let c = 0, t = 0;
+      for (let y = Math.round(by0 + iy); y < by1 - iy; y++) for (let x = Math.round(bx0 + ix); x < bx1 - ix; x++) {
+        const i = (y * W + x) * 4, mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]);
+        c += mn < 150 || (mx - mn > 28 && mx > 90) ? 1 : 0; t++;
+      }
+      return t ? c / t : 0;
+    }
+    const tests = [[hl, 0.12, "highlighted"]];
+    if (layout === "B") tests.push([box, 0.04, "box checked"]);
+    tests.push([pen, 0.015, "pen mark"]);
+    for (const [scores, min, how] of tests) {
       const r = Object.entries(scores).sort((x, y) => y[1] - x[1]);
       if (r[0][1] >= min) {
-        if (r[0][1] >= 3 * r[1][1]) return { choice: r[0][0], how, scores: { hl, pen } };
-        return { choice: "", note: `session type unclear: ${r[0][0]} or ${r[1][0]}`, scores: { hl, pen } };
+        if (r[0][1] >= 3 * r[1][1]) return { choice: r[0][0], how, scores: { hl, pen, box }, areaText };
+        return { choice: "", note: `session type unclear: ${r[0][0]} or ${r[1][0]}`, scores: { hl, pen, box }, areaText };
       }
     }
-    return { choice: "", note: "no session type is marked", scores: { hl, pen } };
+    return { choice: "", note: "no session type is marked", scores: { hl, pen, box }, areaText };
+  }
+
+  // Red text lines in the header band, top to bottom: the student name, then the Job Name.
+  async function readJobLine(band, engine) {
+    const W = band.width, H = band.height, d = band.data;
+    const red = (i) => d[i] > 140 && d[i + 1] < 120 && d[i + 2] < 120 && d[i] - d[i + 2] > 70;
+    const rowCount = new Uint32Array(H);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (red((y * W + x) * 4)) rowCount[y]++;
+    const lines = []; let start = -1;
+    for (let y = 0; y <= H; y++) {
+      const on = y < H && rowCount[y] > 3;
+      if (on && start < 0) start = y;
+      if (!on && start >= 0) { if (y - start > H * 0.015) lines.push([start, y]); start = -1; }
+    }
+    if (lines.length < 2) return "";
+    const [y0, y1] = lines[1];
+    const pad = Math.round((y1 - y0) * 0.4);
+    const ink = redInk(crop(band, 0, Math.max(0, y0 - pad), W, Math.min(H, y1 + pad)));
+    if (!ink) return "";
+    const t = await engine.ocr(scale(ink, 2), { psm: "7" });
+    let text = t.text.trim();
+    if (!/\b20\d\d\b/.test(text.replace(/(\d)[:.,' ](?=\d)/g, "$1"))) {
+      // no year found: read just the start of the line (where "2027 SENIORS" begins) as digits only
+      const start = crop(ink, 0, 0, Math.max(40, Math.round(ink.width * 0.2)), ink.height);
+      for (const f of [2, 3]) {
+        const d = await engine.ocr(scale(start, f), { psm: "7", whitelist: "0123456789" });
+        const m = d.text.replace(/\s/g, "").match(/20\d\d/);
+        if (m) { text = `${m[0]} ${text}`; break; }
+      }
+    }
+    return text;
   }
 
   // crop of the Subject ID value: right of the word "Subject", left of "Class"
   function subjectLine(head, words) {
-    const subj = words.find((w) => /^subject/i.test(w.text));
+    // the label on the left side (form B also has a "Student" label in its right-hand column)
+    const subj = words.find((w) => /^(subject|student)/i.test(w.text) && w.bbox.x0 < head.width * 0.3);
     if (!subj) return null;
     const hgt = subj.bbox.y1 - subj.bbox.y0;
-    let right = head.width;
+    // stop before the right-hand column (page x 0.50; the header crop is 0.56 of the page wide)
+    let right = Math.round(head.width * 0.50 / 0.56);
     for (const w of words) {
       if (/^class/i.test(w.text) && Math.abs(w.bbox.y0 - subj.bbox.y0) < hgt) right = w.bbox.x0;
     }
+    // start after "ID:" when it was read as its own word
+    const idw = words.find((w) => w.bbox.x0 > subj.bbox.x1 && w.bbox.x0 - subj.bbox.x1 < hgt * 1.5 &&
+      Math.abs(w.bbox.y0 - subj.bbox.y0) < hgt * 0.5 && /^[I1l|]?[D0O][:;.]?$/.test(w.text));
+    const left = idw ? idw.bbox.x1 : subj.bbox.x1;
+    if (right - left < 10) return null;
+    // where the number itself was found (even if its digits were misread): words after the label on the same line,
+    // allowing the number to sit higher than the label as it does on form B
+    const cands = words.filter((w) => {
+      const cy = (w.bbox.y0 + w.bbox.y1) / 2;
+      return w.bbox.x0 >= left - 2 && w.bbox.x1 <= right + hgt && cy > subj.bbox.y0 - hgt * 0.6 && cy < subj.bbox.y1 &&
+        /[0-9A-Za-z]/.test(w.text) && !/^(class|_+)$/i.test(w.text);
+    }).sort((p, q) => p.bbox.x0 - q.bbox.x0);
+    // the number starts right after the label; keep only that first run of words
+    const val = [];
+    for (const w of cands) {
+      const prev = val.length ? val[val.length - 1].bbox.x1 : left;
+      if (w.bbox.x0 - prev > hgt * (val.length ? 0.8 : 2.5)) break;
+      val.push(w);
+    }
+    if (val.length) {
+      const vx0 = Math.min(...val.map((w) => w.bbox.x0)), vx1 = Math.max(...val.map((w) => w.bbox.x1));
+      const vy0 = Math.min(...val.map((w) => w.bbox.y0)), vy1 = Math.max(...val.map((w) => w.bbox.y1));
+      const p = Math.round((vy1 - vy0) * 0.3);
+      return crop(head, Math.max(left, vx0 - p), Math.max(0, vy0 - p), Math.min(right, vx1 + p), Math.min(head.height, vy1 + p));
+    }
     const top = Math.max(0, subj.bbox.y0 - Math.floor(hgt / 2));
     const bottom = Math.min(head.height, subj.bbox.y0 + Math.round(hgt * 1.6));
-    if (right - subj.bbox.x1 < 10) return null;
-    return crop(head, subj.bbox.x1, top, right, bottom);
+    return crop(head, left, top, right, bottom);
   }
 
   async function readDigits(engine, img) {
+    img = withoutRules(img);
     const t = await engine.ocr(img, { psm: "7", whitelist: "0123456789:ID" });
     const parts = t.text.split(":");
-    return t.text.replace(/\s/g, "") ? parts[parts.length - 1].replace(/\D/g, "") : "";
+    const first = t.text.replace(/\s/g, "") ? parts[parts.length - 1].replace(/\D/g, "") : "";
+    if (first.length >= 4) return first;
+    // the cut may hold parts of the lines above or below: read it as loose text and keep the longest run of digits
+    const t2 = await engine.ocr(img, { psm: "11", whitelist: "0123456789" });
+    const runs = (t2.text.match(/\d{4,}/g) || []).sort((p, q) => q.length - p.length);
+    return runs[0] || first;
+  }
+
+  // blank out the form's ruled lines (rows that are mostly dark across the cut)
+  function withoutRules(img) {
+    const out = { data: new Uint8ClampedArray(img.data), width: img.width, height: img.height }, d = out.data, W = img.width;
+    for (let y = 0; y < img.height; y++) {
+      let dark = 0;
+      for (let x = 0; x < W; x++) if (d[(y * W + x) * 4] < 140) dark++;
+      if (dark / W > 0.5) for (let x = 0; x < W; x++) { const i = (y * W + x) * 4; d[i] = d[i + 1] = d[i + 2] = 255; }
+    }
+    return out;
   }
 
   // ---------- decision ----------
@@ -327,6 +472,11 @@
     let subjectId = "";
     if (!r.reads.length) {
       reasons.push(r.header.subjectLineFound ? "Subject ID is blank on the slate" : "Subject ID could not be read");
+    } else if (r.barcode && r.reads.includes(r.barcode)) {
+      // one independent read of the printed ID matches the barcode exactly; a misread can't produce
+      // exactly the barcode by chance, so other reads that differ are just misreads
+      subjectId = r.barcode;
+      if (new Set(r.reads).size > 1) notes.push(`Subject ID read as ${r.reads.join(" / ")}; one read matches the barcode`);
     } else {
       const counts = {};
       r.reads.forEach((v) => (counts[v] = (counts[v] || 0) + 1));
@@ -342,7 +492,7 @@
     if (subjectId && r.barcode && subjectId !== r.barcode) {
       reasons.push(`Subject ID ${subjectId} does not match barcode ${r.barcode}`);
     }
-    if (r.category && r.category.key === "BOTH") reasons.push("slate mentions both Non-Contracted and Previous Seniors");
+    if (!r.category && !r.year) reasons.push(r.yearNote || "graduation year could not be read from Job Name");
     if (!r.code && !r.category) reasons.push("school code could not be read");
     else if (knownCodes && knownCodes.size && !knownCodes.has(r.code)) reasons.push(`school code ${r.code} is not on the school list`);
     if (!r.header.first && !r.header.last) reasons.push("student name could not be read");
@@ -371,14 +521,14 @@
   // "ATM - Jordan Alvarez.pdf"
   // "ATM - YBK - Davey Arias"; the session part is left out when there is none
   function fileBase(r, d, fallback, session) {
-    const short = { NONCON: "Non-Contracted", PREV: "Prev Senior" };
+    const short = { NONCON: "Non-Contracted" };
     const code = cleanName(r.code) || (r.category && short[r.category.key]) || "NO CODE";
     const person = cleanName(`${r.header ? r.header.first : ""} ${r.header ? r.header.last : ""}`)
       || `ID ${d.subjectId || r.barcode || fallback}`;
     return session ? `${code} - ${session} - ${person}` : `${code} - ${person}`;
   }
 
-  const api = { CATEGORIES, findCategory, SESSIONS, SESSION_CODES, SESSION_CHOICES, crop, gray, threshold, scale, pad, redInk, parseHeader, readSlate, decide, fileBase, cleanName };
+  const api = { subjectLine, CATEGORIES, findCategory, isRetake, watermarks, withoutTints, SESSIONS, SESSION_CODES, SESSION_CHOICES, crop, gray, threshold, scale, pad, redInk, parseHeader, readSlate, decide, fileBase, cleanName };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.SlateCore = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
